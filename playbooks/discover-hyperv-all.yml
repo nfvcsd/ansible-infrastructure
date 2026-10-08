@@ -1,0 +1,214 @@
+---
+# ============================================================
+# Multi-Host Hyper-V Discovery
+#
+# Discovers VMs across all four Hyper-V hosts.
+#
+# READ-ONLY:
+#   - No changes to Hyper-V
+#   - No changes to Nautobot
+#
+# Checks:
+#   - All four hosts respond successfully
+#   - Discovery returns valid VM information
+#   - VM GUIDs are unique across hosts
+# ============================================================
+
+- name: Discover virtual machines on all Hyper-V hosts
+  hosts: hyperv_hosts
+  gather_facts: false
+  any_errors_fatal: true
+
+  tasks:
+    # --------------------------------------------------------
+    # Verify connectivity
+    # --------------------------------------------------------
+
+    - name: Verify Windows connectivity
+      ansible.windows.win_ping:
+
+    # --------------------------------------------------------
+    # Discover virtual machines
+    # --------------------------------------------------------
+
+    - name: Collect Hyper-V virtual machines
+      ansible.windows.win_powershell:
+        error_action: stop
+        script: |
+          $ErrorActionPreference = 'Stop'
+
+          $vms = @(
+              Get-VM | ForEach-Object {
+                  $vm = $_
+
+                  [PSCustomObject]@{
+                      Name                 = $vm.Name
+                      VMId                 = $vm.VMId.ToString().ToLowerInvariant()
+                      Hypervisor           = $env:COMPUTERNAME
+                      State                = $vm.State.ToString()
+                      Generation           = [int]$vm.Generation
+                      ProcessorCount       = [int]$vm.ProcessorCount
+                      MemoryStartupMB      = [int64]($vm.MemoryStartup / 1MB)
+                      MemoryAssignedMB     = [int64]($vm.MemoryAssigned / 1MB)
+                      DynamicMemoryEnabled = [bool]$vm.DynamicMemoryEnabled
+                  }
+              }
+          )
+
+          $Ansible.Changed = $false
+          $Ansible.Result = @{
+              VMs = $vms
+          }
+      register: hyperv_discovery
+      changed_when: false
+
+    - name: Store discovered virtual machines
+      ansible.builtin.set_fact:
+        hyperv_discovered_vms: "{{ hyperv_discovery.result.VMs }}"
+
+    - name: Verify discovery results
+      ansible.builtin.assert:
+        that:
+          - hyperv_discovered_vms is defined
+          - hyperv_discovered_vms | type_debug == 'list'
+          - >-
+            hyperv_discovered_vms
+            | selectattr('VMId', 'defined')
+            | list
+            | length == hyperv_discovered_vms | length
+        fail_msg: "Invalid Hyper-V discovery results."
+
+    - name: Add successfully discovered host to group
+      ansible.builtin.group_by:
+        key: hyperv_discovery_complete
+
+    - name: Display host discovery summary
+      ansible.builtin.debug:
+        msg:
+          hypervisor: "{{ inventory_hostname }}"
+          discovered_vms: "{{ hyperv_discovered_vms | length }}"
+
+# ============================================================
+# Consolidate VM discovery results on Ansible controller
+# ============================================================
+
+- name: Consolidate Hyper-V discovery
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  tasks:
+    # --------------------------------------------------------
+    # Verify all hosts completed discovery
+    # --------------------------------------------------------
+
+    - name: Verify all Hyper-V hosts completed discovery
+      ansible.builtin.assert:
+        that:
+          - groups.get('hyperv_hosts', []) | length > 0
+          - >-
+            (
+              groups.get('hyperv_discovery_complete', [])
+              | sort
+            )
+            ==
+            (
+              groups['hyperv_hosts']
+              | sort
+            )
+        fail_msg: >-
+          Not all configured Hyper-V hosts completed discovery.
+          Expected: {{ groups.get('hyperv_hosts', []) }}
+          Completed: {{ groups.get('hyperv_discovery_complete', []) }}
+    # --------------------------------------------------------
+    # Aggregate discovered VMs
+    # --------------------------------------------------------
+
+    - name: Initialize consolidated inventory
+      ansible.builtin.set_fact:
+        all_discovered_vms: []
+
+    - name: Combine VM results from all Hyper-V hosts
+      ansible.builtin.set_fact:
+        all_discovered_vms: >-
+          {{
+            all_discovered_vms
+            + hostvars[item].hyperv_discovered_vms
+          }}
+      loop: "{{ groups['hyperv_discovery_complete'] }}"
+      loop_control:
+        label: "{{ item }}"
+
+    # --------------------------------------------------------
+    # Check for duplicate Hyper-V GUIDs
+    # --------------------------------------------------------
+
+    - name: Collect all VM GUIDs
+      ansible.builtin.set_fact:
+        all_vm_guids: >-
+          {{
+            all_discovered_vms
+            | map(attribute='VMId')
+            | map('lower')
+            | list
+          }}
+
+    - name: Initialize duplicate GUID list
+      ansible.builtin.set_fact:
+        duplicate_vm_guids: []
+
+    - name: Identify duplicate VM GUIDs
+      ansible.builtin.set_fact:
+        duplicate_vm_guids: "{{ duplicate_vm_guids + [item] }}"
+      loop: "{{ all_vm_guids | unique | list }}"
+      when: >-
+        (
+          all_vm_guids
+          | select('equalto', item)
+          | list
+          | length
+        ) > 1
+
+    - name: Display duplicate VM GUIDs
+      ansible.builtin.debug:
+        var: duplicate_vm_guids
+      when: duplicate_vm_guids | length > 0
+
+    - name: Verify VM GUIDs are unique
+      ansible.builtin.assert:
+        that:
+          - duplicate_vm_guids | length == 0
+        fail_msg: >-
+          Duplicate Hyper-V VM GUIDs were detected across hosts.
+          Review duplicate_vm_guids before enabling synchronization.
+        success_msg: "All discovered VM GUIDs are unique."
+
+    # --------------------------------------------------------
+    # Display per-host inventory
+    # --------------------------------------------------------
+
+    - name: Display discovered VMs
+      ansible.builtin.debug:
+        msg:
+          name: "{{ item.Name }}"
+          hypervisor: "{{ item.Hypervisor }}"
+          guid: "{{ item.VMId }}"
+          state: "{{ item.State }}"
+          vcpus: "{{ item.ProcessorCount }}"
+          memory_mb: "{{ item.MemoryStartupMB }}"
+      loop: "{{ all_discovered_vms }}"
+      loop_control:
+        label: "{{ item.Name }}"
+
+    # --------------------------------------------------------
+    # Display final summary
+    # --------------------------------------------------------
+
+    - name: Display final discovery summary
+      ansible.builtin.debug:
+        msg:
+          hyperv_hosts: "{{ groups['hyperv_discovery_complete'] | length }}"
+          total_virtual_machines: "{{ all_discovered_vms | length }}"
+          unique_vm_guids: "{{ all_vm_guids | unique | list | length }}"
+          duplicate_vm_guids: "{{ duplicate_vm_guids | length }}"
+          nautobot_modified: false

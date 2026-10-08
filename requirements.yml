@@ -1,0 +1,5 @@
+---
+collections:
+  - name: networktocode.nautobot
+  - name: ansible.windows
+  - name: community.windows

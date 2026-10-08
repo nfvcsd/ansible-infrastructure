@@ -1,0 +1,20 @@
+---
+- name: Collect Linux server inventory
+  hosts: device_roles_linux_server
+  gather_facts: true
+  become: false
+
+  tasks:
+    - name: Display collected server information
+      ansible.builtin.debug:
+        msg:
+          hostname: "{{ ansible_facts.hostname }}"
+          fqdn: "{{ ansible_facts.fqdn }}"
+          operating_system: "{{ ansible_facts.distribution }}"
+          os_version: "{{ ansible_facts.distribution_version }}"
+          architecture: "{{ ansible_facts.architecture }}"
+          cpu_count: "{{ ansible_facts.processor_vcpus }}"
+          memory_mb: "{{ ansible_facts.memtotal_mb }}"
+          virtualization_type: "{{ ansible_facts.virtualization_type }}"
+          virtualization_role: "{{ ansible_facts.virtualization_role }}"
+          ip_addresses: "{{ ansible_facts.all_ipv4_addresses }}"

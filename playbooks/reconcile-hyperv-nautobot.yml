@@ -1,0 +1,148 @@
+---
+# First, collect VM inventory from Hyper-V
+- import_playbook: discover-hyperv.yml
+
+# Then reconcile the discovered VMs against Nautobot
+- name: Reconcile Hyper-V virtual machines with Nautobot
+  hosts: NFV-Vhost-04
+  gather_facts: false
+
+  vars:
+    nautobot_url: "{{ lookup('env', 'NAUTOBOT_URL') | regex_replace('/+$', '') }}"
+    nautobot_token: "{{ lookup('env', 'NAUTOBOT_TOKEN') }}"
+
+  tasks:
+
+    - name: Verify Nautobot credentials are available
+      ansible.builtin.assert:
+        that:
+          - nautobot_url | length > 0
+          - nautobot_token | length > 0
+        fail_msg: "NAUTOBOT_URL and NAUTOBOT_TOKEN must be configured."
+      no_log: true
+
+    - name: Query Nautobot for each discovered VM
+      ansible.builtin.uri:
+        url: >-
+          {{ nautobot_url }}/api/virtualization/virtual-machines/?name__ie={{ item.Name | urlencode }}
+        method: GET
+        headers:
+          Authorization: "Token {{ nautobot_token }}"
+          Accept: "application/json"
+        return_content: true
+        validate_certs: true
+        status_code: 200
+      loop: "{{ discovered_vms }}"
+      loop_control:
+        label: "{{ item.Name }}"
+      delegate_to: localhost
+      register: nautobot_lookup
+      changed_when: false
+      no_log: true
+
+    - name: Initialize reconciliation report
+      ansible.builtin.set_fact:
+        reconciliation_report: []
+
+    - name: Build reconciliation results
+      ansible.builtin.set_fact:
+        reconciliation_report: >-
+          {{
+            reconciliation_report + [{
+              'name': item.Name,
+              'vm_id': item.VMId,
+              'hypervisor': item.Hypervisor,
+              'hyperv_vcpus': item.ProcessorCount | int,
+              'hyperv_memory_mb': item.MemoryStartupMB | int,
+              'dynamic_memory': item.DynamicMemoryEnabled,
+              'nautobot_matches': lookup_result.json.count | int,
+              'nautobot_id': (
+                existing.id if existing is not none else none
+              ),
+              'nautobot_vcpus': (
+                existing.vcpus if existing is not none else none
+              ),
+              'nautobot_memory_mb': (
+                existing.memory if existing is not none else none
+              ),
+              'nautobot_vm_id': (
+                existing.custom_fields.hyperv_vm_id | default(none)
+                if existing is not none else none
+              ),
+              'status': (
+                'MISSING' if (lookup_result.json.count | int) == 0
+                else 'AMBIGUOUS' if (lookup_result.json.count | int) > 1
+                else 'GUID_CONFLICT'
+                  if (
+                    (existing.custom_fields.hyperv_vm_id | default(none))
+                    not in [none, '', item.VMId]
+                  )
+                else 'MATCHED'
+              )
+            }]
+          }}
+      vars:
+        lookup_result: "{{ nautobot_lookup.results[vm_index] }}"
+        existing: >-
+          {{
+            lookup_result.json.results[0]
+            if (lookup_result.json.count | int) == 1
+            else none
+          }}
+      loop: "{{ discovered_vms }}"
+      loop_control:
+        index_var: vm_index
+        label: "{{ item.Name }}"
+
+    - name: Display reconciliation report
+      ansible.builtin.debug:
+        msg: "{{ item }}"
+      loop: "{{ reconciliation_report }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Display reconciliation summary
+      ansible.builtin.debug:
+        msg:
+          hypervisor: "{{ inventory_hostname }}"
+          discovered: "{{ reconciliation_report | length }}"
+          matched: >-
+            {{
+              reconciliation_report
+              | selectattr('status', 'equalto', 'MATCHED')
+              | list | length
+            }}
+          missing: >-
+            {{
+              reconciliation_report
+              | selectattr('status', 'equalto', 'MISSING')
+              | list | length
+            }}
+          ambiguous: >-
+            {{
+              reconciliation_report
+              | selectattr('status', 'equalto', 'AMBIGUOUS')
+              | list | length
+            }}
+          guid_conflicts: >-
+            {{
+              reconciliation_report
+              | selectattr('status', 'equalto', 'GUID_CONFLICT')
+              | list | length
+            }}
+    - name: Display VMs missing from Nautobot
+      ansible.builtin.debug:
+        msg:
+          name: "{{ item.name }}"
+          vm_id: "{{ item.vm_id }}"
+          hypervisor: "{{ item.hypervisor }}"
+          vcpus: "{{ item.hyperv_vcpus }}"
+          memory_mb: "{{ item.hyperv_memory_mb }}"
+      loop: >-
+        {{
+          reconciliation_report
+          | selectattr('status', 'equalto', 'MISSING')
+          | list
+        }}
+      loop_control:
+        label: "{{ item.name }}"

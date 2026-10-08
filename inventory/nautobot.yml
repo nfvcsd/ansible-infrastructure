@@ -1,0 +1,15 @@
+---
+plugin: networktocode.nautobot.inventory
+
+validate_certs: true
+
+config_context: true
+
+group_by:
+  - locations
+  - platforms
+  - device_roles
+
+rename_variables:
+  - pattern: "^tags$"
+    repl: "nautobot_tags"

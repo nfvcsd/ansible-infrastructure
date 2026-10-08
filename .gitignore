@@ -1,0 +1,46 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Ansible runtime
+*.retry
+*.log
+.ansible/
+facts/
+artifacts/
+
+# Credentials and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.kdbx
+*.secret
+*.secrets
+vault-password*
+.vault_pass*
+credentials.yml
+secrets.yml
+krb5cc_*
+
+# SSH
+.ssh/
+id_rsa
+id_ed25519
+
+# OS/editor files
+.DS_Store
+.vscode/
+.idea/
+
+# Temporary files
+*.tmp
+*.bak
+*~
+

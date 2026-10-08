@@ -1,0 +1,9 @@
+---
+all:
+  children:
+    hyperv_hosts:
+      hosts:
+        NFV-Vhost-01:
+        NFV-Vhost-03:
+        NFV-Vhost-04:
+        NFV-Vhost-05:

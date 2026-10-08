@@ -1,0 +1,413 @@
+---
+# ============================================================
+# Create missing Hyper-V VMs in Nautobot
+#
+# Default: Read-only
+#
+# Requirements:
+#   - Existing discover-hyperv.yml
+#   - Nautobot tag: ansible-discovered
+#   - Nautobot VM status: Staged
+#   - Custom field: hyper_v_vm_id
+#
+# Existing VMs are never modified or deleted.
+# ============================================================
+
+- import_playbook: discover-hyperv.yml
+
+- name: Create missing Hyper-V VMs in Nautobot
+  hosts: NFV-Vhost-04
+  gather_facts: false
+
+  vars:
+    nautobot_url: "{{ lookup('env', 'NAUTOBOT_URL') | regex_replace('/+$', '') }}"
+    nautobot_token: "{{ lookup('env', 'NAUTOBOT_TOKEN') }}"
+
+    nautobot_create_enabled: false
+
+    # Existing VM aliases approved during reconciliation
+    hyperv_vm_aliases:
+      "8e7d2d5e-a062-4a32-8526-a2f0620220b1": "6a99f2cf-946c-4781-9290-f1b8584fe84f"
+
+  tasks:
+
+    # --------------------------------------------------------
+    # Validate environment
+    # --------------------------------------------------------
+
+    - name: Verify Nautobot credentials
+      ansible.builtin.assert:
+        that:
+          - nautobot_url | length > 0
+          - nautobot_token | length > 0
+        fail_msg: "NAUTOBOT_URL and NAUTOBOT_TOKEN are required."
+      no_log: true
+
+    - name: Verify discovery returned unique VM GUIDs
+      ansible.builtin.assert:
+        that:
+          - discovered_vms | length > 0
+          - >-
+            (
+              discovered_vms
+              | map(attribute='VMId')
+              | unique
+              | list
+              | length
+            ) == (discovered_vms | length)
+        fail_msg: "Discovery is empty or contains duplicate VM GUIDs."
+
+    # --------------------------------------------------------
+    # Retrieve Nautobot objects
+    # --------------------------------------------------------
+
+    - name: Retrieve Nautobot clusters
+      ansible.builtin.uri:
+        url: "{{ nautobot_url }}/api/virtualization/clusters/?limit=1000"
+        method: GET
+        headers:
+          Authorization: "Token {{ nautobot_token }}"
+          Accept: "application/json"
+        return_content: true
+        status_code: 200
+        validate_certs: true
+      delegate_to: localhost
+      register: nautobot_clusters
+      changed_when: false
+      no_log: true
+
+    - name: Retrieve Nautobot VMs
+      ansible.builtin.uri:
+        url: "{{ nautobot_url }}/api/virtualization/virtual-machines/?limit=1000"
+        method: GET
+        headers:
+          Authorization: "Token {{ nautobot_token }}"
+          Accept: "application/json"
+        return_content: true
+        status_code: 200
+        validate_certs: true
+      delegate_to: localhost
+      register: nautobot_vms
+      changed_when: false
+      no_log: true
+
+    - name: Retrieve Nautobot statuses
+      ansible.builtin.uri:
+        url: "{{ nautobot_url }}/api/extras/statuses/?limit=1000"
+        method: GET
+        headers:
+          Authorization: "Token {{ nautobot_token }}"
+          Accept: "application/json"
+        return_content: true
+        status_code: 200
+        validate_certs: true
+      delegate_to: localhost
+      register: nautobot_statuses
+      changed_when: false
+      no_log: true
+
+    - name: Retrieve Nautobot tags
+      ansible.builtin.uri:
+        url: "{{ nautobot_url }}/api/extras/tags/?limit=1000"
+        method: GET
+        headers:
+          Authorization: "Token {{ nautobot_token }}"
+          Accept: "application/json"
+        return_content: true
+        status_code: 200
+        validate_certs: true
+      delegate_to: localhost
+      register: nautobot_tags
+      changed_when: false
+      no_log: true
+
+    - name: Verify complete API results
+      ansible.builtin.assert:
+        that:
+          - nautobot_clusters.json.next is none
+          - nautobot_vms.json.next is none
+          - nautobot_statuses.json.next is none
+          - nautobot_tags.json.next is none
+        fail_msg: "An API result is paginated. Aborting safely."
+
+    # --------------------------------------------------------
+    # Resolve destination cluster, status, and tag
+    # --------------------------------------------------------
+
+    - name: Find matching cluster
+      ansible.builtin.set_fact:
+        matching_clusters: >-
+          {{
+            nautobot_clusters.json.results
+            | selectattr(
+                'name',
+                'match',
+                '(?i)^' ~ (inventory_hostname | regex_escape) ~ '$'
+              )
+            | list
+          }}
+
+    - name: Find Staged status
+      ansible.builtin.set_fact:
+        matching_statuses: >-
+          {{
+            nautobot_statuses.json.results
+            | selectattr('name', 'equalto', 'Staged')
+            | list
+          }}
+
+    - name: Find discovery tag
+      ansible.builtin.set_fact:
+        matching_tags: >-
+          {{
+            nautobot_tags.json.results
+            | selectattr('name', 'equalto', 'ansible-discovered')
+            | list
+          }}
+
+    - name: Verify required Nautobot objects
+      ansible.builtin.assert:
+        that:
+          - matching_clusters | length == 1
+          - matching_statuses | length == 1
+          - matching_tags | length == 1
+        fail_msg: >-
+          Missing or ambiguous Nautobot cluster, Staged status,
+          or ansible-discovered tag. Check the Nautobot configuration.
+
+    - name: Store Nautobot object IDs
+      ansible.builtin.set_fact:
+        destination_cluster_id: "{{ matching_clusters[0].id }}"
+        destination_cluster_name: "{{ matching_clusters[0].name }}"
+        staged_status_id: "{{ matching_statuses[0].id }}"
+        discovered_tag_id: "{{ matching_tags[0].id }}"
+
+    - name: Display destination
+      ansible.builtin.debug:
+        msg:
+          hypervisor: "{{ inventory_hostname }}"
+          cluster: "{{ destination_cluster_name }}"
+          status: Staged
+          tag: ansible-discovered
+
+    # --------------------------------------------------------
+    # Determine which VMs are genuinely missing
+    # --------------------------------------------------------
+
+    - name: Initialize discovery report
+      ansible.builtin.set_fact:
+        creation_report: []
+
+    - name: Match discovered VMs against Nautobot
+      ansible.builtin.set_fact:
+        creation_report: >-
+          {{
+            creation_report + [{
+              'name': item.Name,
+              'guid': item.VMId,
+              'vcpus': item.ProcessorCount | int,
+              'memory': item.MemoryStartupMB | int,
+              'cluster': destination_cluster_id,
+              'status': (
+                'CONFLICT'
+                if (candidate_ids | length > 1)
+                   or (alias_id | length > 0
+                       and alias_matches | length != 1)
+                   or (
+                     candidate_ids | length == 1
+                     and candidate_records[0].custom_fields.hyper_v_vm_id
+                         | default(none)
+                         not in [none, '', item.VMId]
+                   )
+                else 'EXISTS'
+                if candidate_ids | length == 1
+                else 'MISSING'
+              )
+            }]
+          }}
+      vars:
+        alias_id: "{{ hyperv_vm_aliases.get(item.VMId, '') }}"
+
+        guid_matches: >-
+          {{
+            nautobot_vms.json.results
+            | selectattr(
+                'custom_fields.hyper_v_vm_id',
+                'equalto',
+                item.VMId
+              )
+            | list
+          }}
+
+        name_matches: >-
+          {{
+            nautobot_vms.json.results
+            | selectattr(
+                'name',
+                'match',
+                '(?i)^' ~ (item.Name | regex_escape) ~ '$'
+              )
+            | list
+          }}
+
+        alias_matches: >-
+          {{
+            nautobot_vms.json.results
+            | selectattr('id', 'equalto', alias_id)
+            | list
+          }}
+
+        candidate_ids: >-
+          {{
+            (
+              guid_matches
+              + name_matches
+              + alias_matches
+            )
+            | map(attribute='id')
+            | unique
+            | list
+          }}
+
+        candidate_records: >-
+          {{
+            nautobot_vms.json.results
+            | selectattr('id', 'in', candidate_ids)
+            | list
+          }}
+
+      loop: "{{ discovered_vms }}"
+      loop_control:
+        label: "{{ item.Name }}"
+
+    # --------------------------------------------------------
+    # Prepare creation candidates
+    # --------------------------------------------------------
+
+    - name: Identify missing VMs
+      ansible.builtin.set_fact:
+        missing_vms: >-
+          {{
+            creation_report
+            | selectattr('status', 'equalto', 'MISSING')
+            | list
+          }}
+
+        conflicting_vms: >-
+          {{
+            creation_report
+            | selectattr('status', 'equalto', 'CONFLICT')
+            | list
+          }}
+
+        existing_vms: >-
+          {{
+            creation_report
+            | selectattr('status', 'equalto', 'EXISTS')
+            | list
+          }}
+
+    - name: Display proposed VM creations
+      ansible.builtin.debug:
+        msg:
+          name: "{{ item.name }}"
+          guid: "{{ item.guid }}"
+          vcpus: "{{ item.vcpus }}"
+          memory_mb: "{{ item.memory }}"
+          cluster: "{{ destination_cluster_name }}"
+          status: Staged
+          tag: ansible-discovered
+          action: "PROPOSED CREATION"
+      loop: "{{ missing_vms }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Display identity conflicts
+      ansible.builtin.debug:
+        msg:
+          name: "{{ item.name }}"
+          guid: "{{ item.guid }}"
+          action: "SKIPPED - identity conflict"
+      loop: "{{ conflicting_vms }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Verify no identity conflicts before creation
+      ansible.builtin.assert:
+        that:
+          - conflicting_vms | length == 0
+        fail_msg: >-
+          Identity conflicts detected. No VMs will be created.
+      when:
+        - nautobot_create_enabled | bool
+
+    # --------------------------------------------------------
+    # Create missing VMs
+    # --------------------------------------------------------
+
+    - name: Create missing VMs in Nautobot
+      ansible.builtin.uri:
+        url: "{{ nautobot_url }}/api/virtualization/virtual-machines/"
+        method: POST
+        headers:
+          Authorization: "Token {{ nautobot_token }}"
+          Accept: "application/json"
+        body_format: json
+        body:
+          name: "{{ item.name }}"
+          cluster: "{{ destination_cluster_id }}"
+          status: "{{ staged_status_id }}"
+          vcpus: "{{ item.vcpus }}"
+          memory: "{{ item.memory }}"
+          tags:
+            - "{{ discovered_tag_id }}"
+          custom_fields:
+            hyper_v_vm_id: "{{ item.guid }}"
+        status_code: 201
+        validate_certs: true
+      loop: "{{ missing_vms }}"
+      loop_control:
+        label: "{{ item.name }}"
+      delegate_to: localhost
+      register: created_vms
+      no_log: true
+      when:
+        - nautobot_create_enabled | bool
+        - not ansible_check_mode
+
+    # --------------------------------------------------------
+    # Verify created records
+    # --------------------------------------------------------
+
+    - name: Verify Nautobot creation responses
+      ansible.builtin.assert:
+        that:
+          - item.json.id is defined
+          - item.json.name == item.item.name
+          - item.json.cluster.id == destination_cluster_id
+          - item.json.vcpus | int == item.item.vcpus | int
+          - item.json.memory | int == item.item.memory | int
+          - item.json.custom_fields.hyper_v_vm_id == item.item.guid
+        fail_msg: "Nautobot creation verification failed."
+      loop: "{{ created_vms.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.name | default('unknown') }}"
+      when:
+        - nautobot_create_enabled | bool
+        - not ansible_check_mode
+        - not item.skipped | default(false)
+
+    # --------------------------------------------------------
+    # Summary
+    # --------------------------------------------------------
+
+    - name: Display creation summary
+      ansible.builtin.debug:
+        msg:
+          hypervisor: "{{ inventory_hostname }}"
+          destination_cluster: "{{ destination_cluster_name }}"
+          discovered: "{{ creation_report | length }}"
+          existing: "{{ existing_vms | length }}"
+          missing: "{{ missing_vms | length }}"
+          conflicts: "{{ conflicting_vms | length }}"
+          creation_enabled: "{{ nautobot_create_enabled | bool }}"

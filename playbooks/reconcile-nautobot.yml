@@ -1,0 +1,94 @@
+---
+- name: Reconcile Linux VM inventory with Nautobot
+  hosts: device_roles_linux_server
+  gather_facts: true
+
+  vars:
+    nautobot_api: "{{ lookup('env', 'NAUTOBOT_URL') }}"
+    nautobot_token: "{{ lookup('env', 'NAUTOBOT_TOKEN') }}"
+    nautobot_sync_enabled: false
+
+  tasks:
+    - name: Query existing VM record
+      ansible.builtin.uri:
+        url: "{{ nautobot_api }}/api/virtualization/virtual-machines/"
+        method: GET
+        headers:
+          Authorization: "Token {{ nautobot_token }}"
+          Accept: "application/json"
+        return_content: true
+        validate_certs: true
+        body_format: json
+        status_code: 200
+      delegate_to: localhost
+      register: nautobot_vms
+      no_log: true
+
+    - name: Find matching Nautobot VM
+      ansible.builtin.set_fact:
+        matching_vms: >-
+          {{
+            nautobot_vms.json.results
+            | selectattr('name', 'equalto', inventory_hostname)
+            | list
+          }}
+
+    - name: Verify matching VM exists
+      ansible.builtin.assert:
+        that:
+          - matching_vms | length == 1
+        fail_msg: >-
+          Expected one matching Nautobot VM for
+          {{ inventory_hostname }}. Found {{ matching_vms | length }}.
+
+    - name: Compare inventory
+      ansible.builtin.debug:
+        msg:
+          hostname: "{{ inventory_hostname }}"
+          nautobot_vcpus: "{{ matching_vms[0].vcpus }}"
+          discovered_vcpus: "{{ ansible_facts.processor_vcpus }}"
+          nautobot_memory_mb: "{{ matching_vms[0].memory }}"
+          discovered_usable_memory_mb: "{{ ansible_facts.memtotal_mb }}"
+          cpu_update_needed: >-
+            {{
+              matching_vms[0].vcpus is none or
+              (matching_vms[0].vcpus | int !=
+               ansible_facts.processor_vcpus | int)
+            }}
+    - name: Determine whether vCPU synchronization is needed
+      ansible.builtin.set_fact:
+        cpu_update_needed: >-
+          {{
+            matching_vms[0].vcpus is none
+            and (ansible_facts.processor_vcpus | int > 0)
+          }}
+
+    - name: Display proposed Nautobot update
+      ansible.builtin.debug:
+        msg:
+          vm: "{{ inventory_hostname }}"
+          record_id: "{{ matching_vms[0].id }}"
+          current_vcpus: "{{ matching_vms[0].vcpus }}"
+          proposed_vcpus: "{{ ansible_facts.processor_vcpus }}"
+          update_needed: "{{ cpu_update_needed | bool }}"
+          sync_enabled: "{{ nautobot_sync_enabled | bool }}"
+
+    - name: Update missing vCPU information in Nautobot
+      ansible.builtin.uri:
+        url: >-
+          {{ nautobot_api }}/api/virtualization/virtual-machines/{{ matching_vms[0].id }}/
+        method: PATCH
+        headers:
+          Authorization: "Token {{ nautobot_token }}"
+          Accept: "application/json"
+        body_format: json
+        body:
+          vcpus: "{{ ansible_facts.processor_vcpus | int }}"
+        status_code: 200
+        validate_certs: true
+      delegate_to: localhost
+      no_log: true
+      when:
+        - cpu_update_needed | bool
+        - nautobot_sync_enabled | bool
+        - not ansible_check_mode
