@@ -1,0 +1,489 @@
+---
+# ============================================================
+# Nautobot VM Classification and Reconciliation
+#
+# Uses existing four-host Hyper-V discovery.
+#
+# Identifies:
+#   - VMs without an operating-system platform
+#   - VMs without a Hyper-V GUID
+#   - Nautobot VMs not found on discovered hosts
+#   - GUID conflicts
+#   - Linux VMs ready for integration-service management
+#
+# READ-ONLY:
+#   - Does not modify Nautobot
+#   - Does not modify Hyper-V
+# ============================================================
+
+- import_playbook: discover-hyperv-all.yml
+
+- name: Reconcile Nautobot VM classification
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    nautobot_url: >-
+      {{ lookup('env', 'NAUTOBOT_URL') | regex_replace('/+$', '') }}
+
+    nautobot_token: "{{ lookup('env', 'NAUTOBOT_TOKEN') }}"
+
+    linux_platform_pattern: >-
+      (?i)(linux|ubuntu|debian|rocky|alma|centos|fedora|rhel|red hat|suse|oracle linux)
+
+  tasks:
+
+    # ========================================================
+    # Validate environment
+    # ========================================================
+
+    - name: Verify Nautobot credentials
+      ansible.builtin.assert:
+        that:
+          - nautobot_url | length > 0
+          - nautobot_token | length > 0
+        fail_msg: "NAUTOBOT_URL and NAUTOBOT_TOKEN are required."
+      no_log: true
+
+    - name: Verify complete Hyper-V discovery
+      ansible.builtin.assert:
+        that:
+          - all_discovered_vms is defined
+          - all_discovered_vms | length > 0
+          - duplicate_vm_guids is defined
+          - duplicate_vm_guids | length == 0
+          - >-
+            (
+              groups.get('hyperv_discovery_complete', [])
+              | sort
+            )
+            ==
+            (
+              groups.get('hyperv_hosts', [])
+              | sort
+            )
+        fail_msg: >-
+          Hyper-V discovery is incomplete.
+          Classification has been aborted.
+
+    # ========================================================
+    # Retrieve Nautobot inventory
+    # ========================================================
+
+    - name: Retrieve Nautobot virtual machines
+      ansible.builtin.uri:
+        url: "{{ nautobot_url }}/api/virtualization/virtual-machines/?limit=1000"
+        method: GET
+        headers:
+          Authorization: "Token {{ nautobot_token }}"
+          Accept: "application/json"
+        return_content: true
+        status_code: 200
+        validate_certs: true
+      register: nautobot_vms
+      changed_when: false
+      no_log: true
+
+    - name: Retrieve Nautobot platforms
+      ansible.builtin.uri:
+        url: "{{ nautobot_url }}/api/dcim/platforms/?limit=1000"
+        method: GET
+        headers:
+          Authorization: "Token {{ nautobot_token }}"
+          Accept: "application/json"
+        return_content: true
+        status_code: 200
+        validate_certs: true
+      register: nautobot_platforms
+      changed_when: false
+      no_log: true
+
+    - name: Verify API results are complete
+      ansible.builtin.assert:
+        that:
+          - nautobot_vms.json.next is none
+          - nautobot_platforms.json.next is none
+        fail_msg: >-
+          Nautobot results exceed the API page size.
+          Pagination must be implemented before continuing.
+
+    # ========================================================
+    # Identify Linux platforms
+    # ========================================================
+
+    - name: Identify known Linux platform IDs
+      ansible.builtin.set_fact:
+        linux_platform_ids: >-
+          {{
+            nautobot_platforms.json.results
+            | selectattr(
+                'name',
+                'search',
+                linux_platform_pattern
+              )
+            | map(attribute='id')
+            | list
+          }}
+
+    - name: Display recognized Linux platforms
+      ansible.builtin.debug:
+        msg:
+          recognized_linux_platforms: >-
+            {{
+              nautobot_platforms.json.results
+              | selectattr('id', 'in', linux_platform_ids)
+              | map(attribute='name')
+              | list
+            }}
+
+    # ========================================================
+    # Reconcile Nautobot VMs with Hyper-V discovery
+    # ========================================================
+
+    - name: Initialize classification report
+      ansible.builtin.set_fact:
+        vm_classification_report: []
+
+    - name: Classify Nautobot virtual machines
+      ansible.builtin.set_fact:
+        vm_classification_report: >-
+          {{
+            vm_classification_report + [{
+              'name': item.name,
+              'nautobot_id': item.id,
+              'platform': platform_name,
+              'is_linux': is_linux,
+              'nautobot_guid': stored_guid,
+              'discovered_guid': (
+                candidate.VMId if candidate is not none else ''
+              ),
+              'hypervisor': (
+                candidate.Hypervisor if candidate is not none else ''
+              ),
+              'match_method': match_method,
+              'identity_status': identity_status,
+              'needs_platform': platform_id == '',
+              'needs_guid': (
+                candidate is not none
+                and stored_guid == ''
+                and identity_status == 'MATCHED'
+              )
+            }]
+          }}
+
+      vars:
+
+        # ----------------------------------------------------
+        # Resolve platform UUID from the VM record
+        # ----------------------------------------------------
+
+        platform_id: >-
+          {{
+            item.platform.id
+            if item.platform is mapping
+            else ''
+          }}
+
+        # ----------------------------------------------------
+        # Look up the full platform object
+        #
+        # Nautobot 2.4 returns only an ID, object type,
+        # and URL in the VM's platform reference.
+        # ----------------------------------------------------
+
+        platform_matches: >-
+          {{
+            nautobot_platforms.json.results
+            | selectattr(
+                'id',
+                'equalto',
+                platform_id
+              )
+            | list
+          }}
+
+        # ----------------------------------------------------
+        # Resolve the actual platform name
+        # ----------------------------------------------------
+
+        platform_name: >-
+          {{
+            platform_matches[0].name
+            if platform_matches | length == 1
+            else 'UNASSIGNED'
+            if platform_id == ''
+            else 'UNKNOWN PLATFORM'
+          }}
+
+        is_linux: "{{ platform_id in linux_platform_ids }}"
+
+        # ----------------------------------------------------
+        # Normalize the Nautobot Hyper-V GUID
+        # ----------------------------------------------------
+
+        stored_guid: >-
+          {{
+            (
+              item.custom_fields.hyper_v_vm_id
+              | string
+              | lower
+            )
+            if item.custom_fields.hyper_v_vm_id
+               | default(none) not in [none, '']
+            else ''
+          }}
+
+        # ----------------------------------------------------
+        # Match by Hyper-V GUID
+        # ----------------------------------------------------
+
+        guid_matches: >-
+          {{
+            all_discovered_vms
+            | selectattr(
+                'VMId',
+                'match',
+                '(?i)^' ~ (stored_guid | regex_escape) ~ '$'
+              )
+            | list
+            if stored_guid | length > 0
+            else []
+          }}
+
+        # ----------------------------------------------------
+        # Fall back to name matching only when no GUID exists
+        # ----------------------------------------------------
+
+        name_matches: >-
+          {{
+            all_discovered_vms
+            | selectattr(
+                'Name',
+                'match',
+                '(?i)^' ~ (item.name | regex_escape) ~ '$'
+              )
+            | list
+          }}
+
+        # ----------------------------------------------------
+        # Select the matching Hyper-V VM
+        # ----------------------------------------------------
+
+        candidate: >-
+          {{
+            guid_matches[0]
+            if guid_matches | length == 1
+            else name_matches[0]
+            if stored_guid | length == 0
+               and name_matches | length == 1
+            else none
+          }}
+
+        # ----------------------------------------------------
+        # Record the matching method
+        # ----------------------------------------------------
+
+        match_method: >-
+          {{
+            'GUID'
+            if guid_matches | length == 1
+            else 'NAME'
+            if stored_guid | length == 0
+               and name_matches | length == 1
+            else 'NONE'
+          }}
+
+        # ----------------------------------------------------
+        # Determine identity status
+        # ----------------------------------------------------
+
+        identity_status: >-
+          {{
+            'CONFLICT'
+            if guid_matches | length > 1
+               or (
+                 stored_guid | length > 0
+                 and guid_matches | length == 0
+                 and name_matches | length > 0
+               )
+               or (
+                 stored_guid | length == 0
+                 and name_matches | length > 1
+               )
+            else 'MATCHED'
+            if candidate is not none
+            else 'NOT_DISCOVERED'
+          }}
+
+      loop: "{{ nautobot_vms.json.results }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    # ========================================================
+    # Categorize classification results
+    # ========================================================
+
+    - name: Categorize VM classification results
+      ansible.builtin.set_fact:
+
+        missing_platform_vms: >-
+          {{
+            vm_classification_report
+            | selectattr(
+                'needs_platform',
+                'equalto',
+                true
+              )
+            | list
+          }}
+
+        missing_guid_vms: >-
+          {{
+            vm_classification_report
+            | selectattr(
+                'needs_guid',
+                'equalto',
+                true
+              )
+            | list
+          }}
+
+        identity_conflicts: >-
+          {{
+            vm_classification_report
+            | selectattr(
+                'identity_status',
+                'equalto',
+                'CONFLICT'
+              )
+            | list
+          }}
+
+        not_discovered_vms: >-
+          {{
+            vm_classification_report
+            | selectattr(
+                'identity_status',
+                'equalto',
+                'NOT_DISCOVERED'
+              )
+            | list
+          }}
+
+        linux_ready_vms: >-
+          {{
+            vm_classification_report
+            | selectattr(
+                'is_linux',
+                'equalto',
+                true
+              )
+            | selectattr(
+                'identity_status',
+                'equalto',
+                'MATCHED'
+              )
+            | rejectattr(
+                'nautobot_guid',
+                'equalto',
+                ''
+              )
+            | list
+          }}
+
+    # ========================================================
+    # Display VMs needing platform classification
+    # ========================================================
+
+    - name: Display VMs without platform assignments
+      ansible.builtin.debug:
+        msg:
+          vm: "{{ item.name }}"
+          hypervisor: "{{ item.hypervisor }}"
+          identity_status: "{{ item.identity_status }}"
+          hyperv_guid: "{{ item.discovered_guid }}"
+          action: "VERIFY OPERATING SYSTEM"
+      loop: "{{ missing_platform_vms }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    # ========================================================
+    # Display missing GUIDs
+    # ========================================================
+
+    - name: Display VMs missing Hyper-V GUIDs
+      ansible.builtin.debug:
+        msg:
+          vm: "{{ item.name }}"
+          hypervisor: "{{ item.hypervisor }}"
+          discovered_guid: "{{ item.discovered_guid }}"
+          match_method: "{{ item.match_method }}"
+          action: "REVIEW GUID BEFORE SYNCHRONIZING"
+      loop: "{{ missing_guid_vms }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    # ========================================================
+    # Display identity conflicts
+    # ========================================================
+
+    - name: Display identity conflicts
+      ansible.builtin.debug:
+        msg:
+          vm: "{{ item.name }}"
+          nautobot_guid: "{{ item.nautobot_guid }}"
+          identity_status: "{{ item.identity_status }}"
+          action: "MANUAL REVIEW REQUIRED"
+      loop: "{{ identity_conflicts }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    # ========================================================
+    # Display records not found on Hyper-V
+    # ========================================================
+
+    - name: Display VMs not discovered on Hyper-V
+      ansible.builtin.debug:
+        msg:
+          vm: "{{ item.name }}"
+          nautobot_guid: "{{ item.nautobot_guid }}"
+          platform: "{{ item.platform }}"
+          action: "REVIEW - NOT FOUND ON DISCOVERED HOSTS"
+      loop: "{{ not_discovered_vms }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    # ========================================================
+    # Display Linux VMs ready for integrations
+    # ========================================================
+
+    - name: Display Linux VMs ready for integration management
+      ansible.builtin.debug:
+        msg:
+          vm: "{{ item.name }}"
+          platform: "{{ item.platform }}"
+          hypervisor: "{{ item.hypervisor }}"
+          guid: "{{ item.nautobot_guid }}"
+          status: READY
+      loop: "{{ linux_ready_vms }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    # ========================================================
+    # Final summary
+    # ========================================================
+
+    - name: Display classification summary
+      ansible.builtin.debug:
+        msg:
+          hyperv_hosts: "{{ groups['hyperv_hosts'] | length }}"
+          hyperv_vms_discovered: "{{ all_discovered_vms | length }}"
+          nautobot_vm_records: "{{ vm_classification_report | length }}"
+          missing_platform: "{{ missing_platform_vms | length }}"
+          missing_guid: "{{ missing_guid_vms | length }}"
+          identity_conflicts: "{{ identity_conflicts | length }}"
+          not_discovered: "{{ not_discovered_vms | length }}"
+          linux_ready_for_integrations: "{{ linux_ready_vms | length }}"
+          nautobot_modified: false
+          hyperv_modified: false

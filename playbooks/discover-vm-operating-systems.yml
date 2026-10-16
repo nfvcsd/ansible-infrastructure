@@ -1,0 +1,629 @@
+---
+# ============================================================
+# Discover Linux VM Operating Systems
+#
+# Sources:
+#   - Nautobot dynamic inventory
+#   - Linux SSH fact gathering
+#   - Hyper-V discovery across all configured hosts
+#
+# Features:
+#   - Detect Linux distribution and version
+#   - Match VMs to Nautobot
+#   - Verify Hyper-V GUID identity
+#   - Identify missing Nautobot platforms
+#   - Report unreachable Linux hosts
+#   - Optionally synchronize verified platforms
+#
+# Safety:
+#   - Read-only by default
+#   - Never overwrites existing platforms
+#   - Never modifies Hyper-V VMs
+#   - Does not disable SSH host key verification
+#
+# Enable updates:
+#   -e nautobot_platform_sync_enabled=true
+# ============================================================
+
+
+# ============================================================
+# Stage 1: Gather Linux operating-system facts
+# ============================================================
+
+- name: Discover Linux operating systems
+  hosts: device_roles_linux_server
+  gather_facts: false
+
+  tasks:
+
+    # --------------------------------------------------------
+    # Collect OS facts
+    # --------------------------------------------------------
+
+    - name: Gather Linux distribution facts
+      ansible.builtin.setup:
+        gather_subset:
+          - "!all"
+          - "!min"
+          - distribution
+      register: os_probe
+      ignore_errors: true
+      ignore_unreachable: true
+
+    # --------------------------------------------------------
+    # Identify successful discoveries
+    # --------------------------------------------------------
+
+    - name: Mark successful OS discovery
+      ansible.builtin.set_fact:
+        os_discovery_success: true
+      when:
+        - os_probe is succeeded
+        - os_probe.ansible_facts is defined
+        - os_probe.ansible_facts.ansible_distribution is defined
+        - os_probe.ansible_facts.ansible_distribution_version is defined
+
+    # --------------------------------------------------------
+    # Report successful discoveries
+    # --------------------------------------------------------
+
+    - name: Display discovered operating system
+      ansible.builtin.debug:
+        msg:
+          host: "{{ inventory_hostname }}"
+          distribution: >-
+            {{ os_probe.ansible_facts.ansible_distribution }}
+          version: >-
+            {{ os_probe.ansible_facts.ansible_distribution_version }}
+          status: SUCCESS
+      when:
+        - os_discovery_success | default(false) | bool
+
+    # --------------------------------------------------------
+    # Report unsuccessful discoveries
+    # --------------------------------------------------------
+
+    - name: Display failed OS discoveries
+      ansible.builtin.debug:
+        msg:
+          host: "{{ inventory_hostname }}"
+          status: FAILED
+          reason: >-
+            {{
+              os_probe.msg
+              | default('Operating-system facts unavailable')
+            }}
+      when:
+        - not (os_discovery_success | default(false) | bool)
+
+
+# ============================================================
+# Stage 2: Discover Hyper-V virtual machines
+# ============================================================
+
+- import_playbook: discover-hyperv-all.yml
+
+
+# ============================================================
+# Stage 3: Reconcile operating systems with Nautobot
+# ============================================================
+
+- name: Reconcile discovered Linux operating systems
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+
+    # --------------------------------------------------------
+    # Nautobot configuration
+    # --------------------------------------------------------
+
+    nautobot_url: >-
+      {{ lookup('env', 'NAUTOBOT_URL') | regex_replace('/+$', '') }}
+
+    nautobot_token: "{{ lookup('env', 'NAUTOBOT_TOKEN') }}"
+
+    # --------------------------------------------------------
+    # Synchronization control
+    # --------------------------------------------------------
+
+    nautobot_platform_sync_enabled: false
+
+    # --------------------------------------------------------
+    # Approved OS-to-platform mappings
+    #
+    # Right-hand values must match Nautobot platform names.
+    # Add other distributions after verifying their names.
+    # --------------------------------------------------------
+
+    platform_mappings:
+      "Ubuntu 20.04": "Ubuntu 20.04"
+      "Ubuntu 22.04": "Ubuntu 22.04"
+      "Ubuntu 24.04": "Ubuntu 24.04"
+
+  tasks:
+
+    # ========================================================
+    # Validate configuration
+    # ========================================================
+
+    - name: Verify Nautobot credentials
+      ansible.builtin.assert:
+        that:
+          - nautobot_url | length > 0
+          - nautobot_token | length > 0
+        fail_msg: >-
+          NAUTOBOT_URL and NAUTOBOT_TOKEN must be configured.
+      no_log: true
+
+    - name: Verify complete Hyper-V discovery
+      ansible.builtin.assert:
+        that:
+          - all_discovered_vms is defined
+          - all_discovered_vms | length > 0
+          - duplicate_vm_guids is defined
+          - duplicate_vm_guids | length == 0
+          - >-
+            (
+              groups.get('hyperv_discovery_complete', [])
+              | sort
+            )
+            ==
+            (
+              groups.get('hyperv_hosts', [])
+              | sort
+            )
+        fail_msg: >-
+          Hyper-V discovery is incomplete or duplicate
+          VM GUIDs were detected. Synchronization aborted.
+
+    # ========================================================
+    # Retrieve Nautobot inventory
+    # ========================================================
+
+    - name: Retrieve Nautobot virtual machines
+      ansible.builtin.uri:
+        url: >-
+          {{ nautobot_url }}/api/virtualization/virtual-machines/?limit=1000
+        method: GET
+        headers:
+          Authorization: "Token {{ nautobot_token }}"
+          Accept: "application/json"
+        return_content: true
+        status_code: 200
+        validate_certs: true
+      register: nautobot_vms
+      changed_when: false
+      no_log: true
+
+    - name: Retrieve Nautobot platforms
+      ansible.builtin.uri:
+        url: >-
+          {{ nautobot_url }}/api/dcim/platforms/?limit=1000
+        method: GET
+        headers:
+          Authorization: "Token {{ nautobot_token }}"
+          Accept: "application/json"
+        return_content: true
+        status_code: 200
+        validate_certs: true
+      register: nautobot_platforms
+      changed_when: false
+      no_log: true
+
+    - name: Verify complete Nautobot API results
+      ansible.builtin.assert:
+        that:
+          - nautobot_vms.json.next is none
+          - nautobot_platforms.json.next is none
+        fail_msg: >-
+          Nautobot returned paginated results.
+          Increase the API limit or implement pagination.
+
+    # ========================================================
+    # Display existing Nautobot platforms
+    # ========================================================
+
+    - name: Display available Nautobot platforms
+      ansible.builtin.debug:
+        msg:
+          available_platforms: >-
+            {{
+              nautobot_platforms.json.results
+              | map(attribute='name')
+              | list
+            }}
+
+    # ========================================================
+    # Collect successful Linux OS discoveries
+    # ========================================================
+
+    - name: Initialize OS discovery report
+      ansible.builtin.set_fact:
+        os_discovery_report: []
+        os_discovery_failures: []
+
+    - name: Collect successful Linux OS facts
+      ansible.builtin.set_fact:
+        os_discovery_report: >-
+          {{
+            os_discovery_report + [{
+              'inventory_hostname': item,
+              'distribution': distribution,
+              'version': version,
+              'os_key': os_key
+            }]
+          }}
+      vars:
+        distribution: >-
+          {{
+            hostvars[item].os_probe.ansible_facts.ansible_distribution
+          }}
+
+        version: >-
+          {{
+            hostvars[item].os_probe.ansible_facts.ansible_distribution_version
+          }}
+
+        normalized_version: >-
+          {{
+            version
+            | regex_search('^[0-9]+\.[0-9]+')
+            | default(version, true)
+          }}
+
+        os_key: "{{ distribution ~ ' ' ~ normalized_version }}"
+
+      loop: "{{ groups.get('device_roles_linux_server', []) }}"
+      loop_control:
+        label: "{{ item }}"
+      when:
+        - hostvars[item].os_discovery_success | default(false) | bool
+
+    # ========================================================
+    # Collect failed Linux OS discoveries
+    # ========================================================
+
+    - name: Collect failed Linux OS discoveries
+      ansible.builtin.set_fact:
+        os_discovery_failures: >-
+          {{
+            os_discovery_failures + [{
+              'inventory_hostname': item,
+              'reason': (
+                hostvars[item].os_probe.msg
+                | default('OS facts unavailable')
+              )
+            }]
+          }}
+      loop: "{{ groups.get('device_roles_linux_server', []) }}"
+      loop_control:
+        label: "{{ item }}"
+      when:
+        - not (hostvars[item].os_discovery_success | default(false) | bool)
+
+    # ========================================================
+    # Match Linux VMs against Nautobot and Hyper-V
+    # ========================================================
+
+    - name: Initialize platform reconciliation report
+      ansible.builtin.set_fact:
+        platform_reconciliation: []
+
+    - name: Reconcile verified Linux operating systems
+      ansible.builtin.set_fact:
+        platform_reconciliation: >-
+          {{
+            platform_reconciliation + [{
+              'inventory_hostname': item.inventory_hostname,
+              'distribution': item.distribution,
+              'version': item.version,
+              'os_key': item.os_key,
+              'nautobot_id': (
+                vm.id if vm is not none else ''
+              ),
+              'nautobot_name': (
+                vm.name if vm is not none else ''
+              ),
+              'hyperv_guid': (
+                hyperv_vm.VMId if hyperv_vm is not none else ''
+              ),
+              'hypervisor': (
+                hyperv_vm.Hypervisor
+                if hyperv_vm is not none else ''
+              ),
+              'platform_name': desired_platform,
+              'platform_id': (
+                platform_matches[0].id
+                if platform_matches | length == 1
+                else ''
+              ),
+              'status': match_status
+            }]
+          }}
+
+      vars:
+
+        # ----------------------------------------------------
+        # Match inventory hostname to Nautobot VM
+        # ----------------------------------------------------
+
+        vm_matches: >-
+          {{
+            nautobot_vms.json.results
+            | selectattr(
+                'name',
+                'match',
+                '(?i)^' ~
+                (item.inventory_hostname | regex_escape) ~
+                '$'
+              )
+            | list
+          }}
+
+        vm: >-
+          {{
+            vm_matches[0]
+            if vm_matches | length == 1
+            else none
+          }}
+
+        # ----------------------------------------------------
+        # Retrieve existing Hyper-V GUID
+        # ----------------------------------------------------
+
+        stored_guid: >-
+          {{
+            vm.custom_fields.hyper_v_vm_id | lower
+            if vm is not none
+               and vm.custom_fields.hyper_v_vm_id
+                   | default(none) not in [none, '']
+            else ''
+          }}
+
+        # ----------------------------------------------------
+        # Find matching discovered Hyper-V VM
+        # ----------------------------------------------------
+
+        guid_matches: >-
+          {{
+            all_discovered_vms
+            | selectattr(
+                'VMId',
+                'match',
+                '(?i)^' ~ (stored_guid | regex_escape) ~ '$'
+              )
+            | list
+            if stored_guid | length > 0
+            else []
+          }}
+
+        hyperv_vm: >-
+          {{
+            guid_matches[0]
+            if guid_matches | length == 1
+            else none
+          }}
+
+        # ----------------------------------------------------
+        # Resolve desired Nautobot platform
+        # ----------------------------------------------------
+
+        desired_platform: >-
+          {{
+            platform_mappings.get(item.os_key, '')
+          }}
+
+        platform_matches: >-
+          {{
+            nautobot_platforms.json.results
+            | selectattr(
+                'name',
+                'equalto',
+                desired_platform
+              )
+            | list
+            if desired_platform | length > 0
+            else []
+          }}
+
+        # ----------------------------------------------------
+        # Determine matching status
+        # ----------------------------------------------------
+
+        match_status: >-
+          {{
+            'AMBIGUOUS_NAME'
+            if vm_matches | length > 1
+            else 'NO_NAUTOBOT_VM'
+            if vm is none
+            else 'MISSING_GUID'
+            if stored_guid == ''
+            else 'GUID_NOT_DISCOVERED'
+            if hyperv_vm is none
+            else 'PLATFORM_ALREADY_SET'
+            if vm.platform is mapping
+            else 'NO_PLATFORM_MAPPING'
+            if desired_platform == ''
+            else 'PLATFORM_NOT_FOUND'
+            if platform_matches | length != 1
+            else 'READY'
+          }}
+
+      loop: "{{ os_discovery_report }}"
+      loop_control:
+        label: "{{ item.inventory_hostname }}"
+
+    # ========================================================
+    # Categorize results
+    # ========================================================
+
+    - name: Identify platform updates
+      ansible.builtin.set_fact:
+
+        platform_updates: >-
+          {{
+            platform_reconciliation
+            | selectattr('status', 'equalto', 'READY')
+            | list
+          }}
+
+        platform_skipped: >-
+          {{
+            platform_reconciliation
+            | rejectattr('status', 'equalto', 'READY')
+            | list
+          }}
+
+    # ========================================================
+    # Prevent duplicate Nautobot updates
+    # ========================================================
+
+    - name: Verify unique update targets
+      ansible.builtin.assert:
+        that:
+          - >-
+            (
+              platform_updates
+              | map(attribute='nautobot_id')
+              | unique
+              | list
+              | length
+            ) == (platform_updates | length)
+        fail_msg: >-
+          Multiple Linux hosts matched the same Nautobot VM.
+          No updates will be performed.
+
+    # ========================================================
+    # Display proposed platform updates
+    # ========================================================
+
+    - name: Display proposed platform assignments
+      ansible.builtin.debug:
+        msg:
+          vm: "{{ item.nautobot_name }}"
+          inventory_host: "{{ item.inventory_hostname }}"
+          detected_os: "{{ item.os_key }}"
+          platform: "{{ item.platform_name }}"
+          hypervisor: "{{ item.hypervisor }}"
+          hyperv_guid: "{{ item.hyperv_guid }}"
+          action: WOULD_UPDATE
+      loop: "{{ platform_updates }}"
+      loop_control:
+        label: "{{ item.inventory_hostname }}"
+
+    # ========================================================
+    # Display skipped systems
+    # ========================================================
+
+    - name: Display systems skipped during reconciliation
+      ansible.builtin.debug:
+        msg:
+          inventory_host: "{{ item.inventory_hostname }}"
+          detected_os: "{{ item.os_key }}"
+          status: "{{ item.status }}"
+      loop: "{{ platform_skipped }}"
+      loop_control:
+        label: "{{ item.inventory_hostname }}"
+
+    # ========================================================
+    # Display connection failures
+    # ========================================================
+
+    - name: Display Linux OS discovery failures
+      ansible.builtin.debug:
+        msg:
+          inventory_host: "{{ item.inventory_hostname }}"
+          status: CONNECTION_FAILED
+          reason: "{{ item.reason }}"
+      loop: "{{ os_discovery_failures }}"
+      loop_control:
+        label: "{{ item.inventory_hostname }}"
+
+    # ========================================================
+    # Apply approved platform updates
+    # ========================================================
+
+    - name: Update Nautobot VM platforms
+      ansible.builtin.uri:
+        url: >-
+          {{ nautobot_url }}/api/virtualization/virtual-machines/{{ item.nautobot_id }}/
+        method: PATCH
+        headers:
+          Authorization: "Token {{ nautobot_token }}"
+          Accept: "application/json"
+        body_format: json
+        body:
+          platform: "{{ item.platform_id }}"
+        status_code: 200
+        return_content: true
+        validate_certs: true
+      loop: "{{ platform_updates }}"
+      loop_control:
+        label: "{{ item.nautobot_name }}"
+      register: platform_sync_results
+      no_log: true
+      when:
+        - nautobot_platform_sync_enabled | bool
+        - not ansible_check_mode
+
+    # ========================================================
+    # Verify successful updates
+    # ========================================================
+
+    - name: Verify Nautobot platform updates
+      ansible.builtin.assert:
+        that:
+          - item.json.platform.id == item.item.platform_id
+        fail_msg: >-
+          Platform verification failed for
+          {{ item.item.nautobot_name }}
+        success_msg: >-
+          Verified platform for
+          {{ item.item.nautobot_name }}
+      loop: "{{ platform_sync_results.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.nautobot_name }}"
+      when:
+        - not item.skipped | default(false)
+
+    # ========================================================
+    # Final summary
+    # ========================================================
+
+    - name: Display OS discovery summary
+      ansible.builtin.debug:
+        msg:
+          linux_inventory_hosts: >-
+            {{
+              groups.get('device_roles_linux_server', [])
+              | length
+            }}
+
+          successful_os_discoveries: >-
+            {{ os_discovery_report | length }}
+
+          failed_os_discoveries: >-
+            {{ os_discovery_failures | length }}
+
+          proposed_platform_updates: >-
+            {{ platform_updates | length }}
+
+          skipped_systems: >-
+            {{ platform_skipped | length }}
+
+          hyperv_vms_discovered: >-
+            {{ all_discovered_vms | length }}
+
+          platform_sync_enabled: >-
+            {{ nautobot_platform_sync_enabled | bool }}
+
+          nautobot_modified: >-
+            {{
+              (nautobot_platform_sync_enabled | bool)
+              and (platform_updates | length > 0)
+              and not ansible_check_mode
+            }}
+
+          hyperv_modified: false

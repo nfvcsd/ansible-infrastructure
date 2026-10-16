@@ -1,0 +1,298 @@
+---
+# ============================================================
+# Configure Hyper-V Integration Services for Linux VMs
+#
+# Source of truth:
+#   Nautobot VM platform and hyper_v_vm_id
+#
+# Targets:
+#   All hosts in the hyperv_hosts inventory group
+#
+# Default:
+#   Audit only - no changes
+#
+# Enable changes:
+#   -e hyperv_integrations_apply=true
+# ============================================================
+
+- name: Identify Linux VMs in Nautobot
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    nautobot_url: >-
+      {{ lookup('env', 'NAUTOBOT_URL') | regex_replace('/+$', '') }}
+    nautobot_token: "{{ lookup('env', 'NAUTOBOT_TOKEN') }}"
+
+    # Explicitly recognized Linux platform names
+    linux_platform_pattern: >-
+      (?i)(linux|ubuntu|debian|rocky|alma|centos|fedora|rhel|red hat|suse|oracle linux)
+
+  tasks:
+    - name: Verify Nautobot connection settings
+      ansible.builtin.assert:
+        that:
+          - nautobot_url | length > 0
+          - nautobot_token | length > 0
+      no_log: true
+
+    - name: Retrieve Nautobot virtual machines
+      ansible.builtin.uri:
+        url: "{{ nautobot_url }}/api/virtualization/virtual-machines/?limit=1000"
+        method: GET
+        headers:
+          Authorization: "Token {{ nautobot_token }}"
+          Accept: application/json
+        return_content: true
+        status_code: 200
+        validate_certs: true
+      register: nautobot_vms
+      changed_when: false
+      no_log: true
+
+    - name: Retrieve Nautobot platforms
+      ansible.builtin.uri:
+        url: "{{ nautobot_url }}/api/dcim/platforms/?limit=1000"
+        method: GET
+        headers:
+          Authorization: "Token {{ nautobot_token }}"
+          Accept: application/json
+        return_content: true
+        status_code: 200
+        validate_certs: true
+      register: nautobot_platforms
+      changed_when: false
+      no_log: true
+
+    - name: Verify complete API results
+      ansible.builtin.assert:
+        that:
+          - nautobot_vms.json.next is none
+          - nautobot_platforms.json.next is none
+        fail_msg: >-
+          Nautobot API results are paginated.
+          Increase the limit or implement pagination.
+
+    - name: Identify Linux platforms
+      ansible.builtin.set_fact:
+        linux_platform_ids: >-
+          {{
+            nautobot_platforms.json.results
+            | selectattr(
+                'name',
+                'search',
+                linux_platform_pattern
+              )
+            | map(attribute='id')
+            | list
+          }}
+
+    - name: Initialize Linux VM inventory
+      ansible.builtin.set_fact:
+        linux_vm_guids: []
+        linux_vm_names: []
+        linux_vms_without_guid: []
+
+    - name: Collect Linux VMs with Hyper-V GUIDs
+      ansible.builtin.set_fact:
+        linux_vm_guids: >-
+          {{
+            linux_vm_guids +
+            [item.custom_fields.hyper_v_vm_id | lower]
+          }}
+        linux_vm_names: "{{ linux_vm_names + [item.name] }}"
+      loop: "{{ nautobot_vms.json.results }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when:
+        - item.platform is mapping
+        - (item.platform.id | default('')) in linux_platform_ids
+        - item.custom_fields.hyper_v_vm_id | default(none) not in [none, '']
+
+    - name: Identify Linux VMs without Hyper-V GUIDs
+      ansible.builtin.set_fact:
+        linux_vms_without_guid: >-
+          {{ linux_vms_without_guid + [item.name] }}
+      loop: "{{ nautobot_vms.json.results }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when:
+        - item.platform is mapping
+        - (item.platform.id | default('')) in linux_platform_ids
+        - item.custom_fields.hyper_v_vm_id | default(none) in [none, '']
+
+    - name: Verify unique Linux VM GUIDs
+      ansible.builtin.assert:
+        that:
+          - >-
+            (linux_vm_guids | unique | list | length)
+            == (linux_vm_guids | length)
+        fail_msg: >-
+          Multiple Nautobot Linux VMs have the same Hyper-V GUID.
+          Aborting.
+
+    - name: Display Nautobot Linux VM summary
+      ansible.builtin.debug:
+        msg:
+          linux_vms_with_guid: "{{ linux_vm_guids | length }}"
+          linux_vms_without_guid: "{{ linux_vms_without_guid }}"
+          action: "Only VMs with matching GUIDs will be targeted"
+
+# ============================================================
+# Audit and configure integrations on Hyper-V hosts
+# ============================================================
+
+- name: Configure Linux VM integration services
+  hosts: hyperv_hosts
+  gather_facts: false
+  any_errors_fatal: true
+
+  vars:
+    hyperv_integrations_apply: false
+
+  tasks:
+    - name: Audit and configure Hyper-V integration services
+      ansible.windows.win_powershell:
+        error_action: stop
+        parameters:
+          LinuxVmIds: "{{ hostvars['localhost'].linux_vm_guids }}"
+          Apply: "{{ hyperv_integrations_apply | bool }}"
+        script: |
+          param(
+              [string[]]$LinuxVmIds,
+              [bool]$Apply
+          )
+
+          $ErrorActionPreference = 'Stop'
+          $Ansible.Changed = $false
+
+          $desiredServices = @(
+              'Heartbeat',
+              'Key-Value Pair Exchange',
+              'Shutdown',
+              'Time Synchronization',
+              'VSS',
+              'Guest Service Interface'
+          )
+
+          $results = @()
+          $vms = @(Get-VM)
+
+          foreach ($vm in $vms) {
+
+              $vmId = $vm.VMId.ToString().ToLowerInvariant()
+
+              if ($vmId -notin $LinuxVmIds) {
+                  continue
+              }
+
+              $services = @(
+                  Get-VMIntegrationService -VM $vm
+              )
+
+              foreach ($serviceName in $desiredServices) {
+
+                  $service = $services |
+                      Where-Object { $_.Name -eq $serviceName } |
+                      Select-Object -First 1
+
+                  if ($null -eq $service) {
+                      $results += [PSCustomObject]@{
+                          VMName = $vm.Name
+                          VMId = $vmId
+                          Hypervisor = $env:COMPUTERNAME
+                          Service = $serviceName
+                          Enabled = $false
+                          Action = 'NOT_AVAILABLE'
+                          Status = 'Not available on this host'
+                      }
+
+                      continue
+                  }
+
+                  $action = 'NO_CHANGE'
+
+                  if (-not $service.Enabled) {
+
+                      if ($Apply) {
+
+                          Enable-VMIntegrationService `
+                              -VM $vm `
+                              -Name $serviceName `
+                              -ErrorAction Stop
+
+                          $Ansible.Changed = $true
+                          $action = 'ENABLED'
+
+                      } else {
+
+                          $action = 'WOULD_ENABLE'
+
+                      }
+                  }
+
+                  $current = Get-VMIntegrationService `
+                      -VM $vm `
+                      -Name $serviceName
+
+                  $results += [PSCustomObject]@{
+                      VMName = $vm.Name
+                      VMId = $vmId
+                      Hypervisor = $env:COMPUTERNAME
+                      Service = $serviceName
+                      Enabled = [bool]$current.Enabled
+                      Action = $action
+                      Status = $current.PrimaryStatusDescription
+                  }
+              }
+          }
+
+          $Ansible.Result = @{
+              IntegrationServices = @($results)
+              VmCount = @(
+                  $results | Select-Object -ExpandProperty VMId -Unique
+              ).Count
+          }
+      register: integration_results
+
+    - name: Display integration service changes required
+      ansible.builtin.debug:
+        msg:
+          hypervisor: "{{ inventory_hostname }}"
+          vm: "{{ item.VMName }}"
+          service: "{{ item.Service }}"
+          enabled: "{{ item.Enabled }}"
+          action: "{{ item.Action }}"
+          status: "{{ item.Status }}"
+      loop: >-
+        {{
+          integration_results.result.IntegrationServices
+          | rejectattr('Action', 'equalto', 'NO_CHANGE')
+          | list
+        }}
+      loop_control:
+        label: "{{ item.VMName }} - {{ item.Service }}"
+
+    - name: Display host summary
+      ansible.builtin.debug:
+        msg:
+          hypervisor: "{{ inventory_hostname }}"
+          linux_vms_found: "{{ integration_results.result.VmCount }}"
+          services_checked: >-
+            {{ integration_results.result.IntegrationServices | length }}
+          changes_required: >-
+            {{
+              integration_results.result.IntegrationServices
+              | selectattr('Action', 'equalto', 'WOULD_ENABLE')
+              | list
+              | length
+            }}
+          services_enabled: >-
+            {{
+              integration_results.result.IntegrationServices
+              | selectattr('Action', 'equalto', 'ENABLED')
+              | list
+              | length
+            }}
+          apply_enabled: "{{ hyperv_integrations_apply | bool }}"
