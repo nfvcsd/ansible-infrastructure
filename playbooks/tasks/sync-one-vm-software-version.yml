@@ -1,0 +1,157 @@
+---
+- name: Resolve VM identity and discovered release
+  ansible.builtin.set_fact:
+    software_matches: "{{ software_vms.json.results | selectattr('name', 'equalto', software_host) | list }}"
+    software_detected: "{{ hostvars[software_host].vm_software_detected | default({}) }}"
+
+- name: Determine VM eligibility
+  ansible.builtin.set_fact:
+    software_eligibility: >-
+      {{ 'OS_UNAVAILABLE' if software_detected.version | default('') | length == 0
+         else 'VM_NAME_NOT_UNIQUE' if software_matches | length != 1
+         else 'PLATFORM_MISSING' if software_matches[0].platform is not mapping
+         else 'PLATFORM_OS_MISMATCH' if
+           (('windows' if 'windows' in (software_detected.distribution | lower)
+             else software_detected.distribution | lower)
+            not in (software_matches[0].platform.name | lower))
+         else 'READY' }}
+
+- name: Report skipped VM
+  ansible.builtin.set_fact:
+    vm_software_report: "{{ vm_software_report + [{'vm': software_host, 'status': software_eligibility}] }}"
+  when: software_eligibility != 'READY'
+
+- name: Reconcile verified VM release
+  when: software_eligibility == 'READY'
+  block:
+    - name: Find software version for the existing platform
+      ansible.builtin.uri:
+        url: >-
+          {{ nautobot_url }}/api/dcim/software-versions/?platform={{ software_matches[0].platform.id | urlencode }}&version={{ software_detected.version | urlencode }}&limit=1000
+        method: GET
+        headers:
+          Authorization: "Token {{ nautobot_token }}"
+        return_content: true
+      check_mode: false
+      changed_when: false
+      no_log: true
+      register: software_versions
+
+    - name: Verify software version lookup
+      ansible.builtin.assert:
+        that:
+          - software_versions.json.next is none
+          - software_versions.json.results | length <= 1
+          - software_versions.json.results | rejectattr('platform.id', 'equalto', software_matches[0].platform.id) | list | length == 0
+          - software_versions.json.results | rejectattr('version', 'equalto', software_detected.version) | list | length == 0
+        fail_msg: Software version lookup was ambiguous or returned unexpected records.
+
+    - name: Determine proposed assignment
+      ansible.builtin.set_fact:
+        software_target_id: "{{ software_versions.json.results[0].id if software_versions.json.results | length == 1 else '' }}"
+        software_current_id: "{{ software_matches[0].software_version.id | default('') }}"
+
+    - name: Record proposed software version change
+      ansible.builtin.set_fact:
+        vm_software_report: >-
+          {{ vm_software_report + [{
+            'vm': software_host,
+            'operating_system': software_detected.distribution,
+            'version': software_detected.version,
+            'platform': software_matches[0].platform.name,
+            'status': 'CURRENT' if software_target_id != '' and software_target_id == software_current_id
+                      else 'WOULD_CREATE_AND_ASSIGN' if software_target_id == '' else 'WOULD_ASSIGN'
+          }] }}
+
+    - name: Apply software version assignment
+      when:
+        - nautobot_software_sync_enabled | bool
+        - not ansible_check_mode
+        - software_target_id == '' or software_target_id != software_current_id
+      block:
+        - name: Recheck VM platform and software version before writing
+          ansible.builtin.uri:
+            url: "{{ nautobot_url }}/api/virtualization/virtual-machines/{{ software_matches[0].id }}/"
+            method: GET
+            headers:
+              Authorization: "Token {{ nautobot_token }}"
+            return_content: true
+          changed_when: false
+          no_log: true
+          register: software_current_vm
+
+        - name: Verify VM has not changed during discovery
+          ansible.builtin.assert:
+            that:
+              - software_current_vm.json.name == software_host
+              - software_current_vm.json.platform.id == software_matches[0].platform.id
+              - software_current_vm.json.software_version.id | default('') == software_current_id
+            fail_msg: VM identity, platform or software version changed during discovery; rerun the audit.
+
+        - name: Create missing software version
+          when: software_target_id == ''
+          block:
+            - name: Resolve configured software version status
+              ansible.builtin.uri:
+                url: "{{ nautobot_url }}/api/extras/statuses/?name={{ nautobot_software_version_status | urlencode }}"
+                method: GET
+                headers:
+                  Authorization: "Token {{ nautobot_token }}"
+                return_content: true
+              changed_when: false
+              no_log: true
+              register: software_status
+
+            - name: Verify software version status exists
+              ansible.builtin.assert:
+                that:
+                  - software_status.json.next is none
+                  - software_status.json.results | length == 1
+                  - software_status.json.results[0].name == nautobot_software_version_status
+                fail_msg: Configure a unique Nautobot status valid for Software Versions.
+
+            - name: Create platform software version record
+              ansible.builtin.uri:
+                url: "{{ nautobot_url }}/api/dcim/software-versions/"
+                method: POST
+                headers:
+                  Authorization: "Token {{ nautobot_token }}"
+                body_format: json
+                body:
+                  platform: "{{ software_matches[0].platform.id }}"
+                  version: "{{ software_detected.version }}"
+                  status: "{{ software_status.json.results[0].id }}"
+                  alias: "{{ software_detected.distribution }}"
+                status_code: 201
+                return_content: true
+              no_log: true
+              changed_when: true
+              register: software_created
+
+            - name: Store created version ID
+              ansible.builtin.set_fact:
+                software_target_id: "{{ software_created.json.id }}"
+
+        - name: Assign VM software version
+          ansible.builtin.uri:
+            url: "{{ nautobot_url }}/api/virtualization/virtual-machines/{{ software_matches[0].id }}/"
+            method: PATCH
+            headers:
+              Authorization: "Token {{ nautobot_token }}"
+            body_format: json
+            body:
+              software_version: "{{ software_target_id }}"
+            return_content: true
+          no_log: true
+          changed_when: true
+          register: software_updated
+
+        - name: Verify assigned software version
+          ansible.builtin.assert:
+            that:
+              - software_updated.json.software_version.id == software_target_id
+            success_msg: "Verified software version for {{ software_host }}"
+
+        - name: Record successful assignment
+          ansible.builtin.set_fact:
+            vm_software_report: "{{ vm_software_report + [{'vm': software_host, 'status': 'ASSIGNED', 'version': software_detected.version}] }}"

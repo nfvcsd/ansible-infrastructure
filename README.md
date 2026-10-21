@@ -39,6 +39,7 @@ ansible/
 ├── playbooks/
 │   ├── collect-facts.yml
 │   ├── discover-hyperv-all.yml
+│   ├── sync-vm-software-versions.yml
 │   ├── sync-hyperv-all.yml
 │   ├── reconcile-nautobot.yml
 │   ├── reconcile-vm-platforms.yml
@@ -241,6 +242,64 @@ ansible-playbook playbooks/reconcile-vm-platforms.yml
 ```
 
 This is useful after adding, migrating, or retiring VMs.
+
+### `sync-vm-software-versions.yml`
+
+**Purpose:** Discover Linux and Windows guest OS releases and assign Nautobot
+Software Version records. Requires Nautobot 2.2 or later.
+
+The `nautobot_vm_guests` inventory group selects all virtual machines independently
+of their role or platform. Linux guests require working SSH credentials and a
+compatible Python interpreter. Windows guests require `ansible_connection: winrm`
+or `psrp`, appropriate credentials, and guest connectivity. Windows over SSH is
+not supported by this workflow. Configure guest credentials through inventory or
+private variables; Hyper-V host credentials do not automatically grant guest access.
+
+Linux records use the distribution version (for example, `24.04`). Windows records
+use the OS version/build reported by `Win32_OperatingSystem` (for example,
+`10.0.20348`), with its product caption as the software version alias. This does not
+inventory applications, Linux kernel versions, or Windows cumulative-update revisions.
+
+Records are matched by unique, exact Nautobot VM name and inventory hostname.
+Unreachable guests, ambiguous names, and VMs without platforms are reported and
+skipped. The existing platform name must contain the detected Linux distribution
+name (case-insensitive), or `Windows` for Windows guests. Platform naming aliases
+such as `RHEL` for `RedHat` need review before those guests can synchronize.
+Unclassified or mismatched VMs are reported; this playbook does not assign platforms.
+VMs absent from guest inventory are reported separately.
+
+**Audit (default):**
+
+```bash
+ansible-playbook playbooks/sync-vm-software-versions.yml
+```
+
+**Check-mode preview:**
+
+```bash
+ansible-playbook playbooks/sync-vm-software-versions.yml \
+  -e nautobot_software_sync_enabled=true --check
+```
+
+**Create missing software versions and assign verified VM releases:**
+
+```bash
+ansible-playbook playbooks/sync-vm-software-versions.yml \
+  -e nautobot_software_sync_enabled=true
+```
+
+Existing software versions are reused by platform and exact version. Apply mode
+updates outdated VM assignments and creates missing versions with the `Active`
+status. This status must be enabled for Nautobot Software Versions; override its
+name using `nautobot_software_version_status` if necessary. Existing VM platforms
+and other fields are preserved. The playbook rechecks VM identity, platform, and
+current assignment before writing. Run a single sync at a time to avoid competing
+version creation requests. API errors stop reconciliation; already completed
+assignments remain in place and can be audited by rerunning.
+
+The VM query currently supports up to 1,000 records and stops if additional pages
+exist. Audit mode reports proposals without creating records or changing guests.
+See [Nautobot software versions](https://docs.nautobot.com/projects/core/en/stable/user-guide/feature-guides/software-image-files-and-versions/).
 
 ### `discover-vm-operating-systems.yml`
 

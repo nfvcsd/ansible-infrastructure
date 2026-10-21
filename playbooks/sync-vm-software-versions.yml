@@ -1,0 +1,110 @@
+---
+# Requires Nautobot 2.2+ and guest SSH/WinRM credentials in inventory.
+- name: Discover VM operating system releases
+  hosts: nautobot_vm_guests
+  gather_facts: false
+  tasks:
+    - name: Reset discovery result
+      ansible.builtin.set_fact:
+        vm_software_detected: {}
+
+    - name: Gather Linux operating system facts
+      ansible.builtin.setup:
+        gather_subset: ['!all', '!min', distribution]
+      register: vm_linux_os
+      ignore_errors: true
+      ignore_unreachable: true
+      when: ansible_connection | default('ssh') not in ['winrm', 'psrp']
+
+    - name: Store Linux release
+      ansible.builtin.set_fact:
+        vm_software_detected:
+          distribution: "{{ vm_linux_os.ansible_facts.ansible_distribution }}"
+          version: "{{ vm_linux_os.ansible_facts.ansible_distribution_version }}"
+      when:
+        - vm_linux_os.ansible_facts.ansible_distribution_version is defined
+        - vm_linux_os.ansible_facts.ansible_system | default('Linux') == 'Linux'
+
+    - name: Gather Windows operating system release
+      ansible.windows.win_powershell:
+        error_action: stop
+        script: |
+          $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+          $Ansible.Changed = $false
+          $Ansible.Result = @{
+              distribution = [string]$os.Caption
+              version = [string]$os.Version
+          }
+      check_mode: false
+      register: vm_windows_os
+      ignore_errors: true
+      ignore_unreachable: true
+      when: ansible_connection | default('ssh') in ['winrm', 'psrp']
+
+    - name: Store Windows release
+      ansible.builtin.set_fact:
+        vm_software_detected: "{{ vm_windows_os.result }}"
+      when: vm_windows_os.result.version is defined
+
+- name: Reconcile VM software versions with Nautobot
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    nautobot_url: "{{ lookup('env', 'NAUTOBOT_URL') | regex_replace('/+$', '') }}"
+    nautobot_token: "{{ lookup('env', 'NAUTOBOT_TOKEN') }}"
+    nautobot_software_sync_enabled: false
+    nautobot_software_version_status: Active
+  tasks:
+    - name: Verify credentials and VM inventory
+      ansible.builtin.assert:
+        that:
+          - nautobot_url | length > 0
+          - nautobot_token | length > 0
+          - groups.get('nautobot_vm_guests', []) | length > 0
+        fail_msg: Configure Nautobot credentials and the nautobot_vm_guests inventory group.
+      no_log: true
+
+    - name: Retrieve Nautobot VM records
+      ansible.builtin.uri:
+        url: "{{ nautobot_url }}/api/virtualization/virtual-machines/?limit=1000"
+        headers:
+          Authorization: "Token {{ nautobot_token }}"
+        method: GET
+        return_content: true
+      check_mode: false
+      changed_when: false
+      no_log: true
+      register: software_vms
+
+    - name: Verify complete inventory and software-version support
+      ansible.builtin.assert:
+        that:
+          - software_vms.json.next is none
+          - software_vms.json.results | rejectattr('software_version', 'defined') | list | length == 0
+        fail_msg: Requires Nautobot 2.2+ with software_version support and an unpaginated VM response.
+
+    - name: Initialize software version report
+      ansible.builtin.set_fact:
+        vm_software_report: []
+
+    - name: Reconcile each inventoried VM
+      ansible.builtin.include_tasks: tasks/sync-one-vm-software-version.yml
+      loop: "{{ groups.get('nautobot_vm_guests', []) }}"
+      loop_control:
+        loop_var: software_host
+        label: "{{ software_host }}"
+
+    - name: Display software version report
+      ansible.builtin.debug:
+        var: vm_software_report
+
+    - name: Report Nautobot VMs absent from dynamic inventory
+      ansible.builtin.debug:
+        msg:
+          vm: "{{ item.name }}"
+          status: NOT_IN_GUEST_INVENTORY
+      loop: "{{ software_vms.json.results }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: item.name not in groups.get('nautobot_vm_guests', [])
