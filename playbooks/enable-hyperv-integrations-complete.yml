@@ -1,0 +1,550 @@
+---
+# ============================================================
+# Complete Hyper-V Integration Configuration
+#
+# Stage 1:
+#   Configure Hyper-V integration services on Windows hosts.
+#
+# Stage 2:
+#   Install and configure Ubuntu Hyper-V guest utilities.
+#
+# Stage 3:
+#   Repair KVP device registration when necessary.
+#
+# Stage 4:
+#   Verify KVP service functionality.
+#
+# Modes:
+#
+# Audit:
+#   ansible-playbook \
+#     playbooks/enable-hyperv-integrations-complete.yml
+#
+# Apply:
+#   ansible-playbook \
+#     playbooks/enable-hyperv-integrations-complete.yml \
+#     -e hyperv_integrations_apply=true
+#
+# Safety:
+#   - Read-only by default
+#   - No automatic reboot
+#   - No Nautobot modifications
+#   - No system Python changes
+#   - Udev recovery only when needed
+# ============================================================
+
+
+# ============================================================
+# Stage 1: Configure Hyper-V Host Integration Services
+# ============================================================
+
+- import_playbook: configure-linux-hyperv-integrations.yml
+
+
+# ============================================================
+# Stage 2: Configure Ubuntu Guest Integration Utilities
+# ============================================================
+
+- name: Configure Hyper-V guest integration utilities
+  hosts: hyperv_linux_guests
+  gather_facts: true
+
+  vars:
+
+    # --------------------------------------------------------
+    # Configuration
+    # --------------------------------------------------------
+
+    hyperv_integrations_apply: false
+
+    hyperv_guest_manage_kvp: true
+
+    hyperv_guest_install_tracking_packages: true
+
+    hyperv_guest_repair_udev: true
+
+    # --------------------------------------------------------
+    # Supported distributions
+    # --------------------------------------------------------
+
+    hyperv_guest_supported_distributions:
+      - Ubuntu
+
+    # --------------------------------------------------------
+    # Kernel-specific packages
+    # --------------------------------------------------------
+
+    hyperv_guest_kernel_packages:
+      - "linux-cloud-tools-{{ ansible_kernel }}"
+      - "linux-tools-{{ ansible_kernel }}"
+
+    # --------------------------------------------------------
+    # Kernel tracking packages
+    # --------------------------------------------------------
+
+    hyperv_guest_tracking_packages:
+      - linux-cloud-tools-generic
+      - linux-tools-generic
+
+    # --------------------------------------------------------
+    # KVP configuration
+    # --------------------------------------------------------
+
+    hyperv_guest_kvp_service_name: hv-kvp-daemon.service
+
+    hyperv_guest_kvp_device_path: /dev/vmbus/hv_kvp
+
+    hyperv_guest_kvp_sysfs_path: >-
+      /sys/devices/virtual/misc/vmbus!hv_kvp
+
+    hyperv_guest_kvp_systemd_device: >-
+      sys-devices-virtual-misc-vmbus\x21hv_kvp.device
+
+  tasks:
+
+    # ========================================================
+    # Validate guest
+    # ========================================================
+
+    - name: Verify supported operating system
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution in hyperv_guest_supported_distributions
+        fail_msg: >-
+          {{ inventory_hostname }} runs
+          {{ ansible_distribution }}.
+          Automatic guest-tool configuration is currently
+          supported only on Ubuntu.
+
+    - name: Display guest information
+      ansible.builtin.debug:
+        msg:
+          vm: "{{ inventory_hostname }}"
+          distribution: "{{ ansible_distribution }}"
+          version: "{{ ansible_distribution_version }}"
+          kernel: "{{ ansible_kernel }}"
+          apply_changes: "{{ hyperv_integrations_apply | bool }}"
+
+    # ========================================================
+    # Determine required packages
+    # ========================================================
+
+    - name: Determine tracking package eligibility
+      ansible.builtin.set_fact:
+        hyperv_guest_use_generic_tracking: >-
+          {{
+            ansible_kernel is search('-generic$')
+            and hyperv_guest_install_tracking_packages | bool
+          }}
+
+    - name: Build required package list
+      ansible.builtin.set_fact:
+        hyperv_guest_required_packages: >-
+          {{
+            hyperv_guest_kernel_packages
+            +
+            (
+              hyperv_guest_tracking_packages
+              if hyperv_guest_use_generic_tracking | bool
+              else []
+            )
+          }}
+
+    - name: Display required packages
+      ansible.builtin.debug:
+        msg:
+          vm: "{{ inventory_hostname }}"
+          kernel: "{{ ansible_kernel }}"
+          packages: "{{ hyperv_guest_required_packages }}"
+
+    # ========================================================
+    # Audit installed packages
+    # ========================================================
+
+    - name: Check installed Hyper-V packages
+      ansible.builtin.command:
+        argv:
+          - dpkg-query
+          - -W
+          - "-f=${Status}"
+          - "{{ item }}"
+      loop: "{{ hyperv_guest_required_packages }}"
+      loop_control:
+        label: "{{ item }}"
+      register: hyperv_guest_package_audit
+      changed_when: false
+      failed_when: false
+
+    - name: Initialize missing package list
+      ansible.builtin.set_fact:
+        hyperv_guest_missing_packages: []
+
+    - name: Collect missing packages
+      ansible.builtin.set_fact:
+        hyperv_guest_missing_packages: >-
+          {{
+            hyperv_guest_missing_packages + [item.item]
+          }}
+      loop: "{{ hyperv_guest_package_audit.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: >-
+        item.rc != 0
+        or 'install ok installed' not in item.stdout
+
+    - name: Display package audit
+      ansible.builtin.debug:
+        msg:
+          vm: "{{ inventory_hostname }}"
+          missing_packages: "{{ hyperv_guest_missing_packages }}"
+          status: >-
+            {{
+              'COMPLETE'
+              if hyperv_guest_missing_packages | length == 0
+              else 'PACKAGES_MISSING'
+            }}
+
+    # ========================================================
+    # Install missing packages
+    # ========================================================
+
+    - name: Install Hyper-V guest packages
+      ansible.builtin.apt:
+        name: "{{ hyperv_guest_required_packages }}"
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+      become: true
+      register: hyperv_guest_package_install
+      when:
+        - hyperv_integrations_apply | bool
+        - hyperv_guest_missing_packages | length > 0
+        - not ansible_check_mode
+
+    # ========================================================
+    # Inspect KVP kernel device
+    # ========================================================
+
+    - name: Check KVP character device
+      ansible.builtin.stat:
+        path: "{{ hyperv_guest_kvp_device_path }}"
+      register: hyperv_guest_kvp_device
+
+    - name: Check KVP sysfs device
+      ansible.builtin.stat:
+        path: "{{ hyperv_guest_kvp_sysfs_path | trim }}"
+      register: hyperv_guest_kvp_sysfs
+
+    - name: Display KVP device information
+      ansible.builtin.debug:
+        msg:
+          vm: "{{ inventory_hostname }}"
+          device_exists: >-
+            {{ hyperv_guest_kvp_device.stat.exists }}
+          sysfs_exists: >-
+            {{ hyperv_guest_kvp_sysfs.stat.exists }}
+
+    # ========================================================
+    # Inspect systemd device state
+    # ========================================================
+
+    - name: Check systemd KVP device state
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - is-active
+          - "{{ hyperv_guest_kvp_systemd_device | trim }}"
+      register: hyperv_guest_kvp_systemd_before
+      changed_when: false
+      failed_when: false
+
+    - name: Display initial systemd KVP device state
+      ansible.builtin.debug:
+        msg:
+          vm: "{{ inventory_hostname }}"
+          device_unit: >-
+            {{ hyperv_guest_kvp_systemd_device | trim }}
+          state: >-
+            {{
+              hyperv_guest_kvp_systemd_before.stdout
+              | default('unknown')
+            }}
+
+    # ========================================================
+    # Determine whether udev recovery is necessary
+    # ========================================================
+
+    - name: Determine whether KVP device recovery is required
+      ansible.builtin.set_fact:
+        hyperv_guest_kvp_recovery_required: >-
+          {{
+            hyperv_guest_kvp_device.stat.exists
+            and hyperv_guest_kvp_sysfs.stat.exists
+            and (
+              hyperv_guest_kvp_systemd_before.stdout
+              | default('unknown')
+              | trim
+            ) != 'active'
+          }}
+
+    - name: Report required udev recovery
+      ansible.builtin.debug:
+        msg:
+          vm: "{{ inventory_hostname }}"
+          recovery_required: >-
+            {{ hyperv_guest_kvp_recovery_required }}
+          action: >-
+            {{
+              'RELOAD_UDEV_AND_REGISTER_DEVICE'
+              if hyperv_guest_kvp_recovery_required | bool
+              else 'NO_RECOVERY_REQUIRED'
+            }}
+
+    # ========================================================
+    # Repair KVP device registration
+    #
+    # This addresses:
+    #
+    # Dependency failed for hv-kvp-daemon.service
+    #
+    # when /dev/vmbus/hv_kvp exists but its systemd
+    # device unit is inactive.
+    #
+    # Confirmed working on NFV-Munki-01.
+    # ========================================================
+
+    - name: Recover Hyper-V KVP device registration
+      become: true
+      when:
+        - hyperv_integrations_apply | bool
+        - hyperv_guest_manage_kvp | bool
+        - hyperv_guest_repair_udev | bool
+        - hyperv_guest_kvp_recovery_required | bool
+        - not ansible_check_mode
+
+      block:
+
+        # ----------------------------------------------------
+        # Reload udev rules
+        # ----------------------------------------------------
+
+        - name: Reload udev rules
+          ansible.builtin.command:
+            argv:
+              - udevadm
+              - control
+              - --reload-rules
+          changed_when: true
+
+        # ----------------------------------------------------
+        # Re-register KVP device
+        # ----------------------------------------------------
+
+        - name: Trigger KVP device registration
+          ansible.builtin.command:
+            argv:
+              - udevadm
+              - trigger
+              - --action=add
+              - /sys/devices/virtual/misc/vmbus!hv_kvp
+          changed_when: true
+
+        # ----------------------------------------------------
+        # Wait for device events
+        # ----------------------------------------------------
+
+        - name: Wait for udev processing
+          ansible.builtin.command:
+            argv:
+              - udevadm
+              - settle
+          changed_when: false
+
+        # ----------------------------------------------------
+        # Reset previous service failures
+        # ----------------------------------------------------
+
+        - name: Reset KVP service failure state
+          ansible.builtin.command:
+            argv:
+              - systemctl
+              - reset-failed
+              - hv-kvp-daemon.service
+          changed_when: false
+
+    # ========================================================
+    # Verify systemd device after recovery
+    # ========================================================
+
+    - name: Check systemd KVP device state after recovery
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - is-active
+          - "{{ hyperv_guest_kvp_systemd_device | trim }}"
+      register: hyperv_guest_kvp_systemd_after
+      changed_when: false
+      failed_when: false
+
+    - name: Display final systemd KVP device state
+      ansible.builtin.debug:
+        msg:
+          vm: "{{ inventory_hostname }}"
+          state: >-
+            {{
+              hyperv_guest_kvp_systemd_after.stdout
+              | default('unknown')
+            }}
+          recovered: >-
+            {{
+              hyperv_guest_kvp_recovery_required | bool
+              and
+              (
+                hyperv_guest_kvp_systemd_after.stdout
+                | default('')
+                | trim
+              ) == 'active'
+            }}
+
+    # ========================================================
+    # Validate KVP device before starting service
+    # ========================================================
+
+    - name: Verify KVP device is ready
+      ansible.builtin.assert:
+        that:
+          - hyperv_guest_kvp_device.stat.exists
+          - hyperv_guest_kvp_sysfs.stat.exists
+          - >-
+            (
+              hyperv_guest_kvp_systemd_after.stdout
+              | default('')
+              | trim
+            ) == 'active'
+        fail_msg: >-
+          {{ inventory_hostname }}:
+          Hyper-V KVP device is not ready.
+
+          Character device:
+          {{ hyperv_guest_kvp_device.stat.exists }}
+
+          Sysfs device:
+          {{ hyperv_guest_kvp_sysfs.stat.exists }}
+
+          Systemd device:
+          {{ hyperv_guest_kvp_systemd_after.stdout | default('unknown') }}
+
+          Check the Hyper-V integration service, guest
+          kernel drivers, and udev rules.
+      when:
+        - hyperv_integrations_apply | bool
+        - hyperv_guest_manage_kvp | bool
+        - not ansible_check_mode
+
+    # ========================================================
+    # Enable and start KVP daemon
+    # ========================================================
+
+    - name: Enable and start Hyper-V KVP daemon
+      ansible.builtin.systemd_service:
+        name: "{{ hyperv_guest_kvp_service_name }}"
+        enabled: true
+        state: started
+      become: true
+      register: hyperv_guest_kvp_start
+      when:
+        - hyperv_integrations_apply | bool
+        - hyperv_guest_manage_kvp | bool
+        - >-
+          (
+            hyperv_guest_kvp_systemd_after.stdout
+            | default('')
+            | trim
+          ) == 'active'
+        - not ansible_check_mode
+
+    # ========================================================
+    # Gather service status
+    # ========================================================
+
+    - name: Gather Linux service information
+      ansible.builtin.service_facts:
+
+    - name: Determine KVP daemon state
+      ansible.builtin.set_fact:
+        hyperv_guest_kvp_service: >-
+          {{
+            ansible_facts.services.get(
+              hyperv_guest_kvp_service_name,
+              {}
+            )
+          }}
+
+    # ========================================================
+    # Verify daemon
+    # ========================================================
+
+    - name: Verify KVP daemon is running
+      ansible.builtin.assert:
+        that:
+          - >-
+            hyperv_guest_kvp_service.state
+            | default('unknown') == 'running'
+        success_msg: >-
+          {{ inventory_hostname }}:
+          Hyper-V KVP daemon is running.
+        fail_msg: >-
+          {{ inventory_hostname }}:
+          Hyper-V KVP daemon is not running.
+      when:
+        - hyperv_integrations_apply | bool
+        - hyperv_guest_manage_kvp | bool
+        - not ansible_check_mode
+
+    # ========================================================
+    # Final guest summary
+    # ========================================================
+
+    - name: Display Hyper-V guest integration summary
+      ansible.builtin.debug:
+        msg:
+          vm: "{{ inventory_hostname }}"
+          distribution: "{{ ansible_distribution }}"
+          version: "{{ ansible_distribution_version }}"
+          kernel: "{{ ansible_kernel }}"
+
+          required_packages: >-
+            {{ hyperv_guest_required_packages }}
+
+          packages_missing_before_apply: >-
+            {{ hyperv_guest_missing_packages }}
+
+          kvp_device_exists: >-
+            {{ hyperv_guest_kvp_device.stat.exists }}
+
+          kvp_sysfs_exists: >-
+            {{ hyperv_guest_kvp_sysfs.stat.exists }}
+
+          kvp_device_initial_state: >-
+            {{
+              hyperv_guest_kvp_systemd_before.stdout
+              | default('unknown')
+            }}
+
+          kvp_device_final_state: >-
+            {{
+              hyperv_guest_kvp_systemd_after.stdout
+              | default('unknown')
+            }}
+
+          udev_recovery_required: >-
+            {{ hyperv_guest_kvp_recovery_required }}
+
+          kvp_service_state: >-
+            {{
+              hyperv_guest_kvp_service.state
+              | default('not_found')
+            }}
+
+          configuration_applied: >-
+            {{ hyperv_integrations_apply | bool }}
