@@ -134,6 +134,7 @@ The playbook connects to Hyper-V hosts and collects:
 - Power state
 - Virtual processor count
 - Configured memory
+- Total provisioned virtual disk capacity
 
 It consolidates discovery results and checks for duplicate GUIDs.
 
@@ -157,6 +158,7 @@ The playbook reconciles:
 - Hyper-V GUID
 - Virtual CPU allocation
 - Memory allocation
+- Total provisioned virtual disk capacity
 - Cluster association
 - Missing VM records
 
@@ -188,6 +190,25 @@ ansible-playbook playbooks/sync-hyperv-all.yml \
 Review proposed changes before enabling cluster synchronization or VM creation.
 
 Existing records should preserve unrelated fields such as status, platform, primary IP, interfaces, and tags.
+
+Disk synchronization uses Nautobot's `disk` field. It sums the provisioned `Size`
+of all attached virtual disks, divides by 2^30 bytes (PowerShell's `1GB`), and
+rounds the total upward to a whole number. This measures allocated guest disk
+capacity, not filesystem free space or the VHD file's current storage consumption.
+Checkpoint parent disks are not counted separately. A VM with no attached disks
+has a capacity of zero.
+
+Disk changes use `nautobot_sync_enabled`, and newly created records include disk
+capacity when available. If any disk cannot be inspected, or a pass-through disk
+is present, the entire VM's disk capacity is reported as unavailable: existing
+values are preserved, and new records omit the disk field. Other fields can still
+sync. Use `-e nautobot_sync_enabled=true --check` to preview proposed disk updates
+without writing them; the default audit leaves update proposals gated by the sync
+flags.
+
+References: [Nautobot VM fields](https://docs.nautobot.com/projects/ansible/en/latest/networktocode.nautobot/module/virtual_machine.html)
+and [Microsoft Get-VHD](https://learn.microsoft.com/en-us/powershell/module/hyper-v/get-vhd).
+
 
 ### `reconcile-nautobot.yml`
 

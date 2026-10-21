@@ -41,6 +41,28 @@
               Get-VM | ForEach-Object {
                   $vm = $_
 
+                  # Sum provisioned capacity, including the current differencing
+                  # disk only (never add its checkpoint parents again).
+                  $diskGB = $null
+                  $diskError = $null
+                  try {
+                      [decimal]$diskBytes = 0
+                      foreach ($drive in @(Get-VMHardDiskDrive -VM $vm -ErrorAction Stop)) {
+                          if ([string]::IsNullOrWhiteSpace($drive.Path)) {
+                              throw 'Pass-through disk capacity is not supported'
+                          }
+                          $vhd = Get-VHD -Path $drive.Path -ErrorAction Stop
+                          if ($null -eq $vhd.Size -or $vhd.Size -le 0) {
+                              throw 'Virtual disk capacity is unavailable'
+                          }
+                          $diskBytes += $vhd.Size
+                      }
+                      # PowerShell 1GB is 2^30 bytes; round the total upward.
+                      $diskGB = [int64][math]::Ceiling($diskBytes / 1GB)
+                  } catch {
+                      $diskError = $_.Exception.Message
+                  }
+
                   [PSCustomObject]@{
                       Name                 = $vm.Name
                       VMId                 = $vm.VMId.ToString().ToLowerInvariant()
@@ -50,6 +72,8 @@
                       ProcessorCount       = [int]$vm.ProcessorCount
                       MemoryStartupMB      = [int64]($vm.MemoryStartup / 1MB)
                       MemoryAssignedMB     = [int64]($vm.MemoryAssigned / 1MB)
+                      DiskCapacityGB       = $diskGB
+                      DiskDiscoveryError   = $diskError
                       DynamicMemoryEnabled = [bool]$vm.DynamicMemoryEnabled
                   }
               }

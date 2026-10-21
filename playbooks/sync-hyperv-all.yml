@@ -269,6 +269,18 @@
       ansible.builtin.set_fact:
         vm_reconciliation: []
 
+    - name: Report unavailable disk capacity
+      ansible.builtin.debug:
+        msg:
+          vm: "{{ item.Name }}"
+          hypervisor: "{{ item.Hypervisor }}"
+          disk_sync: "Skipped; existing Nautobot disk capacity will be preserved"
+          reason: "{{ item.DiskDiscoveryError | default('Capacity was not collected', true) }}"
+      loop: "{{ all_discovered_vms }}"
+      loop_control:
+        label: "{{ item.Name }}"
+      when: item.DiskCapacityGB | default(none) is none
+
     - name: Reconcile discovered virtual machines
       ansible.builtin.set_fact:
         vm_reconciliation: >-
@@ -280,6 +292,7 @@
               'cluster_id': target_cluster,
               'vcpus': item.ProcessorCount | int,
               'memory': item.MemoryStartupMB | int,
+              'disk': item.DiskCapacityGB | default(none),
               'nautobot_id': (
                 existing.id if existing is not none else none
               ),
@@ -430,6 +443,17 @@
               else {}
             )
             | combine(
+              {'disk': item.DiskCapacityGB | int}
+              if existing is not none
+                 and nautobot_sync_enabled | bool
+                 and item.DiskCapacityGB | default(none) is not none
+                 and (
+                   existing.disk | default(none) is none
+                   or existing.disk | int != item.DiskCapacityGB | int
+                 )
+              else {}
+            )
+            | combine(
               {
                 'custom_fields': {
                   'hyper_v_vm_id': item.VMId | lower
@@ -556,6 +580,7 @@
           guid: "{{ item.guid }}"
           vcpus: "{{ item.vcpus }}"
           memory_mb: "{{ item.memory }}"
+          disk_gb: "{{ item.disk }}"
           action: "CREATE if enabled"
       loop: "{{ missing_vms }}"
       loop_control:
@@ -607,6 +632,7 @@
           status: "{{ staged_status_id }}"
           vcpus: "{{ item.vcpus }}"
           memory: "{{ item.memory }}"
+          disk: "{{ item.disk if item.disk is not none else omit }}"
           tags:
             - "{{ discovered_tag_id }}"
           custom_fields:
@@ -647,6 +673,11 @@
             )
           - >-
             (
+              'disk' not in item.item.changes
+              or item.json.disk | int == item.item.disk | int
+            )
+          - >-
+            (
               'custom_fields' not in item.item.changes
               or
               item.json.custom_fields.hyper_v_vm_id
@@ -672,6 +703,7 @@
           - item.json.cluster.id == item.item.cluster_id
           - item.json.vcpus | int == item.item.vcpus | int
           - item.json.memory | int == item.item.memory | int
+          - item.item.disk is none or item.json.disk | int == item.item.disk | int
           - item.json.custom_fields.hyper_v_vm_id == item.item.guid
         fail_msg: "Creation verification failed for {{ item.item.name }}"
         success_msg: "Verified creation: {{ item.item.name }}"
