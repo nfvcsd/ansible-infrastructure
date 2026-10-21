@@ -437,6 +437,8 @@ ansible-playbook playbooks/discover-vm-operating-systems.yml \
 ```
 
 The operating-system mappings must match existing Nautobot platform names.
+Ubuntu 20.04, 22.04, and 24.04 all map to the `Ubuntu` platform; release numbers
+and codenames are handled by `sync-vm-software-versions.yml`.
 
 ### `discover-unclassified-vms.yml`
 
@@ -476,6 +478,9 @@ ansible-playbook playbooks/discover-unclassified-vms.yml \
 ```
 
 **Limitations:** Guest probing requires an approved candidate and a reachable management IP address.
+The default Ubuntu release mappings target the existing `Ubuntu` platform.
+This workflow assigns missing platforms; use `sync-vm-software-versions.yml`
+to assign numbered software versions and release aliases.
 
 ### `configure-linux-hyperv-integrations.yml`
 

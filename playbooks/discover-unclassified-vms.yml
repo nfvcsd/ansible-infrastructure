@@ -95,9 +95,9 @@
     # --------------------------------------------------------
 
     vm_discovery_platform_mappings:
-      "ubuntu:20.04": "Ubuntu 20.04"
-      "ubuntu:22.04": "Ubuntu 22.04"
-      "ubuntu:24.04": "Ubuntu 24.04"
+      "ubuntu:20.04": "Ubuntu"
+      "ubuntu:22.04": "Ubuntu"
+      "ubuntu:24.04": "Ubuntu"
 
   tasks:
 
@@ -423,9 +423,9 @@
     nautobot_platform_sync_enabled: false
 
     vm_discovery_platform_mappings:
-      "ubuntu:20.04": "Ubuntu 20.04"
-      "ubuntu:22.04": "Ubuntu 22.04"
-      "ubuntu:24.04": "Ubuntu 24.04"
+      "ubuntu:20.04": "Ubuntu"
+      "ubuntu:22.04": "Ubuntu"
+      "ubuntu:24.04": "Ubuntu"
 
   tasks:
 
