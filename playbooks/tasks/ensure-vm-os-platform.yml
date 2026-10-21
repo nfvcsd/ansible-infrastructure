@@ -1,0 +1,106 @@
+---
+# Invoked only for a uniquely identified VM with successfully detected OS facts.
+- name: Select desired OS platform name
+  ansible.builtin.set_fact:
+    software_desired_platform_name: >-
+      {{ nautobot_os_platform_names.get(software_detected.distribution,
+         software_detected.distribution | regex_replace('^Microsoft ', '')) }}
+
+- name: Find existing desired OS platform
+  ansible.builtin.set_fact:
+    software_desired_platforms: >-
+      {{ software_platforms.json.results
+         | selectattr('name', 'equalto', software_desired_platform_name) | list }}
+
+- name: Verify unique desired platform
+  ansible.builtin.assert:
+    that:
+      - software_desired_platforms | length <= 1
+      - software_desired_platform_name | trim | length > 0
+
+- name: Report proposed platform action
+  ansible.builtin.set_fact:
+    vm_software_report: >-
+      {{ vm_software_report + [{
+        'vm': software_host,
+        'operating_system': software_detected.distribution,
+        'version': software_detected.version,
+        'current_platform': software_platform_matches[0].name if software_platform_matches | length == 1 else none,
+        'proposed_platform': software_desired_platform_name,
+        'status': 'WOULD_CREATE_AND_ASSIGN_PLATFORM' if software_desired_platforms | length == 0 else 'WOULD_ASSIGN_PLATFORM'
+      }] }}
+
+- name: Apply OS platform onboarding
+  when:
+    - nautobot_software_sync_enabled | bool
+    - not ansible_check_mode
+  block:
+    - name: Recheck VM before changing its platform
+      ansible.builtin.uri:
+        url: "{{ nautobot_url }}/api/virtualization/virtual-machines/{{ software_matches[0].id }}/"
+        method: GET
+        headers:
+          Authorization: "Token {{ nautobot_token }}"
+        return_content: true
+      no_log: true
+      changed_when: false
+      register: software_platform_vm
+
+    - name: Verify original VM identity and assignments
+      ansible.builtin.assert:
+        that:
+          - software_platform_vm.json.name == software_host
+          - software_platform_vm.json.platform.id | default('') == software_matches[0].platform.id | default('')
+          - software_platform_vm.json.software_version.id | default('') == software_matches[0].software_version.id | default('')
+        fail_msg: VM changed during discovery; rerun the audit.
+
+    - name: Create missing OS platform
+      ansible.builtin.uri:
+        url: "{{ nautobot_url }}/api/dcim/platforms/"
+        method: POST
+        headers:
+          Authorization: "Token {{ nautobot_token }}"
+        body_format: json
+        body:
+          name: "{{ software_desired_platform_name }}"
+        return_content: true
+        status_code: 201
+      register: software_new_platform
+      no_log: true
+      changed_when: true
+      when: software_desired_platforms | length == 0
+
+    - name: Cache new platform for subsequent VMs
+      ansible.builtin.set_fact:
+        software_platforms: >-
+          {{ software_platforms | combine({'json': {'results':
+             software_platforms.json.results + [software_new_platform.json]}}, recursive=true) }}
+        software_desired_platforms: "{{ [software_new_platform.json] }}"
+      when: software_new_platform is not skipped
+
+    - name: Assign platform and clear incompatible previous software version
+      ansible.builtin.uri:
+        url: "{{ nautobot_url }}/api/virtualization/virtual-machines/{{ software_matches[0].id }}/"
+        method: PATCH
+        headers:
+          Authorization: "Token {{ nautobot_token }}"
+        body_format: json
+        body:
+          platform: "{{ software_desired_platforms[0].id }}"
+          software_version: null
+        return_content: true
+      no_log: true
+      changed_when: true
+      register: software_platform_updated
+
+    - name: Verify platform assignment
+      ansible.builtin.assert:
+        that:
+          - software_platform_updated.json.platform.id == software_desired_platforms[0].id
+          - software_platform_updated.json.software_version is none
+
+    - name: Continue software version reconciliation using updated platform
+      ansible.builtin.set_fact:
+        software_matches: "{{ [software_platform_updated.json] }}"
+        software_platform_matches: "{{ software_desired_platforms }}"
+        software_eligibility: READY

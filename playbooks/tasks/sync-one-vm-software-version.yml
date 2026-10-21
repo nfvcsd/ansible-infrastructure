@@ -20,14 +20,32 @@
          else 'PLATFORM_UNRESOLVED' if software_platform_matches | length != 1
            or software_platform_matches[0].name | default('') | length == 0
          else 'PLATFORM_OS_MISMATCH' if
+           nautobot_os_platform_names.get(software_detected.distribution, '') != software_platform_matches[0].name
+           and
            (('windows' if 'windows' in (software_detected.distribution | lower)
              else software_detected.distribution | lower)
             not in (software_platform_matches[0].name | lower))
          else 'READY' }}
 
+- name: Onboard missing or explicitly approved replacement OS platforms
+  ansible.builtin.include_tasks: ensure-vm-os-platform.yml
+  when:
+    - nautobot_os_platform_create_enabled | bool
+    - software_eligibility == 'PLATFORM_MISSING' or
+      (software_eligibility == 'PLATFORM_OS_MISMATCH' and nautobot_os_platform_replace_enabled | bool)
+
 - name: Report skipped VM
   ansible.builtin.set_fact:
-    vm_software_report: "{{ vm_software_report + [{'vm': software_host, 'status': software_eligibility}] }}"
+    vm_software_report: >-
+      {{ vm_software_report + [{
+        'vm': software_host, 'status': software_eligibility,
+        'operating_system': software_detected.distribution | default('unknown'),
+        'version': software_detected.version | default('unknown'),
+        'platform': software_platform_matches[0].name if software_platform_matches | length == 1 else none,
+        'connection': hostvars[software_host].ansible_connection | default('ssh'),
+        'target': hostvars[software_host].ansible_host | default(software_host),
+        'reason': hostvars[software_host].vm_software_failure | default('')
+      }] }}
   when: software_eligibility != 'READY'
 
 - name: Reconcile verified VM release

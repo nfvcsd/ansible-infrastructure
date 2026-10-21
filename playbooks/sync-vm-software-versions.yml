@@ -3,10 +3,23 @@
 - name: Discover VM operating system releases
   hosts: nautobot_vm_guests
   gather_facts: false
+  vars:
+    vm_windows_dns_suffix: ''
   tasks:
     - name: Reset discovery result
       ansible.builtin.set_fact:
         vm_software_detected: {}
+        vm_software_failure: ''
+
+    - name: Use explicitly supplied DNS suffix for Windows Kerberos identity
+      ansible.builtin.set_fact:
+        ansible_winrm_kerberos_hostname_override: >-
+          {{ inventory_hostname if '.' in inventory_hostname
+             else inventory_hostname ~ '.' ~ vm_windows_dns_suffix }}
+      when:
+        - ansible_connection | default('ssh') == 'winrm'
+        - vm_windows_dns_suffix | length > 0
+        - ansible_winrm_kerberos_hostname_override is not defined
 
     - name: Gather Linux operating system facts
       ansible.builtin.setup:
@@ -46,6 +59,14 @@
         vm_software_detected: "{{ vm_windows_os.result }}"
       when: vm_windows_os.result.version is defined
 
+    - name: Record guest discovery failure details
+      ansible.builtin.set_fact:
+        vm_software_failure: >-
+          {{ vm_windows_os.msg | default('Windows OS result unavailable')
+             if ansible_connection | default('ssh') in ['winrm', 'psrp']
+             else vm_linux_os.msg | default('Linux OS result unavailable') }}
+      when: vm_software_detected.version is not defined
+
 - name: Reconcile VM software versions with Nautobot
   hosts: localhost
   connection: local
@@ -55,6 +76,9 @@
     nautobot_token: "{{ lookup('env', 'NAUTOBOT_TOKEN') }}"
     nautobot_software_sync_enabled: false
     nautobot_software_version_status: Active
+    nautobot_os_platform_create_enabled: false
+    nautobot_os_platform_replace_enabled: false
+    nautobot_os_platform_names: {}
   tasks:
     - name: Verify credentials and VM inventory
       ansible.builtin.assert:

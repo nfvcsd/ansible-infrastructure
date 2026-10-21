@@ -265,7 +265,8 @@ Unreachable guests, ambiguous names, and VMs without platforms are reported and
 skipped. The existing platform name must contain the detected Linux distribution
 name (case-insensitive), or `Windows` for Windows guests. Platform naming aliases
 such as `RHEL` for `RedHat` need review before those guests can synchronize.
-Unclassified or mismatched VMs are reported; this playbook does not assign platforms.
+Unclassified or mismatched VMs are reported by default. Optional platform onboarding
+is described below.
 VMs absent from guest inventory are reported separately.
 
 **Audit (default):**
@@ -296,6 +297,79 @@ and other fields are preserved. The playbook rechecks VM identity, platform, and
 current assignment before writing. Run a single sync at a time to avoid competing
 version creation requests. API errors stop reconciliation; already completed
 assignments remain in place and can be audited by rerunning.
+
+#### Optional OS platform creation and correction
+
+Missing Software Version records are already created with
+`nautobot_software_sync_enabled=true`. To also create and assign missing OS
+**Platforms**, enable `nautobot_os_platform_create_enabled=true`.
+Existing mismatched platforms are preserved unless you additionally enable
+`nautobot_os_platform_replace_enabled=true`.
+
+Preview platform creation and correction, including the detected OS and current
+platform:
+
+```bash
+ansible-playbook playbooks/sync-vm-software-versions.yml \
+  -e nautobot_os_platform_create_enabled=true \
+  -e nautobot_os_platform_replace_enabled=true
+```
+
+To apply the reviewed proposals, add `-e nautobot_software_sync_enabled=true`.
+`--check` always prevents writes, even when all flags are enabled.
+
+New platform names default to the Linux distribution name or Windows product
+caption with the leading `Microsoft ` removed. Version numbers are stored in
+Software Version records. To reuse your own platform naming convention, pass a
+private YAML variables file with an explicit mapping, for example:
+
+```yaml
+nautobot_os_platform_names:
+  Ubuntu: Ubuntu Linux
+  Microsoft Windows Server 2019 Standard: Windows Server 2019
+```
+
+An explicit mapping also approves that platform name for the detected distribution.
+Platforms created earlier in the run are reused. Replacement clears the old software
+version before assigning a version for the new platform; if a later API operation
+fails, rerun after resolving it. API writes are not transactional. Unreachable or
+unidentified guests never trigger platform creation. Unresolved platform IDs remain
+skipped rather than being automatically replaced.
+
+#### Windows OS discovery and Kerberos
+
+OS discovery runs only after guest authentication succeeds. A `Server not found in
+Kerberos database` error indicates that Kerberos cannot resolve the requested server
+principal. Check the target FQDN, DNS and AD service principal registration. An IP
+address or unsuitable short name can cause this failure. The repository's Windows
+settings use manual Kerberos tickets, so run `klist` on the controller to verify the
+current ticket as well.
+
+For a guest reached by IP, configure its verified AD hostname in private host variables:
+
+```yaml
+ansible_winrm_kerberos_hostname_override: windows-vm.example.com
+```
+
+For guests whose inventory names match their AD computer names, an optional suffix
+sets the Kerberos hostname while retaining the connection address:
+
+```bash
+ansible-playbook playbooks/sync-vm-software-versions.yml \
+  -e vm_windows_dns_suffix=example.com
+```
+
+Use the actual DNS suffix for those computers. This option applies to WinRM and
+preserves explicit per-host overrides; it does not fix missing SPNs, DNS entries,
+expired tickets, firewalls or WinRM timeouts. For PSRP, configure
+`ansible_psrp_negotiate_hostname_override` per host. Verify Windows VMs have
+`ansible_connection: winrm` or `psrp`; guests falling back to SSH need their
+inventory connection settings corrected.
+
+The report includes the connection type, target address and discovery failure
+reason, plus detected OS and existing platform for mismatches. No passwords or
+API tokens are intentionally included.
+See [Ansible Kerberos troubleshooting](https://docs.ansible.com/projects/ansible-core/2.17/os_guide/windows_winrm.html#troubleshooting-kerberos).
 
 The VM query currently supports up to 1,000 records and stops if additional pages
 exist. Audit mode reports proposals without creating records or changing guests.
