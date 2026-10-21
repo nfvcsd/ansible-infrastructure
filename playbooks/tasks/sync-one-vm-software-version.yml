@@ -4,16 +4,25 @@
     software_matches: "{{ software_vms.json.results | selectattr('name', 'equalto', software_host) | list }}"
     software_detected: "{{ hostvars[software_host].vm_software_detected | default({}) }}"
 
+- name: Resolve full platform record by ID
+  ansible.builtin.set_fact:
+    software_platform_matches: >-
+      {{ software_platforms.json.results
+         | selectattr('id', 'equalto', software_matches[0].platform.id | default(''))
+         | list if software_matches | length == 1 else [] }}
+
 - name: Determine VM eligibility
   ansible.builtin.set_fact:
     software_eligibility: >-
       {{ 'OS_UNAVAILABLE' if software_detected.version | default('') | length == 0
          else 'VM_NAME_NOT_UNIQUE' if software_matches | length != 1
          else 'PLATFORM_MISSING' if software_matches[0].platform is not mapping
+         else 'PLATFORM_UNRESOLVED' if software_platform_matches | length != 1
+           or software_platform_matches[0].name | default('') | length == 0
          else 'PLATFORM_OS_MISMATCH' if
            (('windows' if 'windows' in (software_detected.distribution | lower)
              else software_detected.distribution | lower)
-            not in (software_matches[0].platform.name | lower))
+            not in (software_platform_matches[0].name | lower))
          else 'READY' }}
 
 - name: Report skipped VM
@@ -58,7 +67,7 @@
             'vm': software_host,
             'operating_system': software_detected.distribution,
             'version': software_detected.version,
-            'platform': software_matches[0].platform.name,
+            'platform': software_platform_matches[0].name,
             'status': 'CURRENT' if software_target_id != '' and software_target_id == software_current_id
                       else 'WOULD_CREATE_AND_ASSIGN' if software_target_id == '' else 'WOULD_ASSIGN'
           }] }}

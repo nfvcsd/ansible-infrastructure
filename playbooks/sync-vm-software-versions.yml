@@ -84,6 +84,24 @@
           - software_vms.json.results | rejectattr('software_version', 'defined') | list | length == 0
         fail_msg: Requires Nautobot 2.2+ with software_version support and an unpaginated VM response.
 
+    - name: Retrieve full Nautobot platform records
+      ansible.builtin.uri:
+        url: "{{ nautobot_url }}/api/dcim/platforms/?limit=1000"
+        headers:
+          Authorization: "Token {{ nautobot_token }}"
+        method: GET
+        return_content: true
+      check_mode: false
+      changed_when: false
+      no_log: true
+      register: software_platforms
+
+    - name: Verify complete platform lookup
+      ansible.builtin.assert:
+        that:
+          - software_platforms.json.next is none
+        fail_msg: Platform response is paginated; increase the limit or implement pagination before syncing.
+
     - name: Initialize software version report
       ansible.builtin.set_fact:
         vm_software_report: []
