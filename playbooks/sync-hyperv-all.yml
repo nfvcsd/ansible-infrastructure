@@ -120,6 +120,8 @@
         return_content: true
         validate_certs: true
         status_code: 200
+      # Read-only API requests are required to build --check proposals.
+      check_mode: false
       register: nautobot_clusters
       changed_when: false
       no_log: true
@@ -134,6 +136,8 @@
         return_content: true
         validate_certs: true
         status_code: 200
+      # Read-only API requests are required to build --check proposals.
+      check_mode: false
       register: nautobot_vms
       changed_when: false
       no_log: true
@@ -148,6 +152,8 @@
         return_content: true
         validate_certs: true
         status_code: 200
+      # Read-only API requests are required to build --check proposals.
+      check_mode: false
       register: nautobot_statuses
       changed_when: false
       no_log: true
@@ -162,6 +168,8 @@
         return_content: true
         validate_certs: true
         status_code: 200
+      # Read-only API requests are required to build --check proposals.
+      check_mode: false
       register: nautobot_tags
       changed_when: false
       no_log: true

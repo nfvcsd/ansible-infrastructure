@@ -83,8 +83,21 @@
           $Ansible.Result = @{
               VMs = $vms
           }
+      # Discovery only reads Hyper-V state, including during --check previews.
+      check_mode: false
       register: hyperv_discovery
       changed_when: false
+
+    - name: Verify PowerShell returned VM inventory
+      ansible.builtin.assert:
+        that:
+          - not (hyperv_discovery.skipped | default(false))
+          - hyperv_discovery.result is defined
+          - hyperv_discovery.result is mapping
+          - hyperv_discovery.result.VMs is defined
+        fail_msg: >-
+          Hyper-V discovery did not return a VMs result. Verify the discovery
+          task ran and inspect its PowerShell errors before continuing.
 
     - name: Store discovered virtual machines
       ansible.builtin.set_fact:
