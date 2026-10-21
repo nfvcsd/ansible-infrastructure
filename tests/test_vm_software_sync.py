@@ -11,7 +11,7 @@ from urllib.parse import parse_qs, urlsplit
 import yaml
 
 REPO = Path(__file__).resolve().parents[1]
-platforms = [{'id': 'p1', 'name': 'Ubuntu 24.04'}, {'id': 'p2', 'name': 'Windows Server'}]
+platforms = [{'id': 'p1', 'name': 'Ubuntu'}, {'id': 'p2', 'name': 'Windows Server'}, {'id': 'p3', 'name': 'Ubuntu 24.04'}]
 versions = []
 writes = []
 vms = [
@@ -19,6 +19,7 @@ vms = [
     {'id': 'v2', 'name': 'missing', 'platform': None, 'software_version': None},
     {'id': 'v3', 'name': 'mismatch', 'platform': {'id': 'p2'}, 'software_version': None},
     {'id': 'v4', 'name': 'unreachable', 'platform': {'id': 'p1'}, 'software_version': None},
+    {'id': 'v6', 'name': 'legacy', 'platform': {'id': 'p3'}, 'software_version': None},
     {'id': 'v5', 'name': 'unresolved', 'platform': {'id': 'absent'}, 'software_version': None},
 ]
 
@@ -68,6 +69,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_PATCH(self):
         body = self.read_body()
         writes.append(('PATCH', self.path, body))
+        if self.path.startswith('/api/dcim/software-versions/'):
+            version = next(v for v in versions if v['id'] == self.path.rstrip('/').split('/')[-1])
+            version.update(body)
+            return self.reply(version)
         vm = next(v for v in vms if v['id'] == self.path.rstrip('/').split('/')[-1])
         for key, value in body.items():
             vm[key] = {'id': value} if key in ['platform', 'software_version'] and value is not None else value
@@ -77,8 +82,9 @@ server = HTTPServer(('127.0.0.1', 0), Handler)
 threading.Thread(target=server.serve_forever, daemon=True).start()
 try:
     with tempfile.TemporaryDirectory() as tmp:
-        hosts = {v['name']: {'vm_software_detected': {'distribution': 'Ubuntu', 'version': '24.04'}} for v in vms}
+        hosts = {v['name']: {'vm_software_detected': {'family': 'Linux', 'distribution': 'Ubuntu', 'version': '24.04', 'alias': 'noble'}} for v in vms}
         hosts['unreachable'] = {}
+        hosts['missing']['vm_software_detected'] = {'family': 'Linux', 'distribution': 'Debian', 'version': '24.04', 'alias': 'test-codename'}
         inventory = Path(tmp) / 'inventory.yml'
         inventory.write_text(yaml.safe_dump({'all': {'hosts': {'localhost': {'ansible_connection': 'local'}}, 'children': {'nautobot_vm_guests': {'hosts': hosts}}}}))
         env = {**os.environ, 'NAUTOBOT_URL': f'http://127.0.0.1:{server.server_port}', 'NAUTOBOT_TOKEN': 'mock-only'}
@@ -91,8 +97,8 @@ try:
             ('check mode', flags + sync + ['--check'], 0),
             ('version-only apply', sync, 2),
             ('create-only apply', ['-e', 'nautobot_os_platform_create_enabled=true'] + sync, 6),
-            ('apply', flags + sync, 8),
-            ('repeat apply', flags + sync, 8),
+            ('apply', flags + sync, 10),
+            ('repeat apply', flags + sync, 10),
         ]:
             run = subprocess.run(base + args, env=env, cwd=tmp, capture_output=True, text=True)
             assert run.returncode == 0, run.stdout + run.stderr
@@ -103,7 +109,26 @@ try:
             if label in ['platform audit', 'check mode']:
                 assert 'WOULD_CREATE_AND_ASSIGN_PLATFORM' in run.stdout
             print(f'{label}: passed', flush=True)
-        assert len(platforms) == 3 and len(versions) == 2
+        assert len(platforms) == 4 and len(versions) == 2
         assert all(v['software_version'] for v in vms[:3])
+        assert {v['alias'] for v in versions} == {'noble', 'test-codename'}
+        assert len({v['platform']['id'] for v in versions}) == 2  # Equal numbers on different distributions remain distinct.
+        # Repair old aliases, including when the VM already has the version assigned.
+        versions[0]['alias'] = 'Ubuntu'
+        before = len(writes)
+        run = subprocess.run(base + sync, env=env, cwd=tmp, capture_output=True, text=True)
+        assert run.returncode == 0, run.stdout + run.stderr
+        assert len(writes) == before + 1 and versions[0]['alias'] == 'noble'
+        print('existing alias correction: passed', flush=True)
+        # Missing codenames must not erase an existing alias.
+        for host in hosts.values():
+            if 'vm_software_detected' in host:
+                host['vm_software_detected']['alias'] = ''
+        inventory.write_text(yaml.safe_dump({'all': {'hosts': {'localhost': {'ansible_connection': 'local'}}, 'children': {'nautobot_vm_guests': {'hosts': hosts}}}}))
+        before = len(writes)
+        run = subprocess.run(base + sync, env=env, cwd=tmp, capture_output=True, text=True)
+        assert run.returncode == 0, run.stdout + run.stderr
+        assert len(writes) == before and versions[0]['alias'] == 'noble'
+        print('unavailable codename preserves alias: passed', flush=True)
 finally:
     server.shutdown()

@@ -4,6 +4,19 @@
     software_matches: "{{ software_vms.json.results | selectattr('name', 'equalto', software_host) | list }}"
     software_detected: "{{ hostvars[software_host].vm_software_detected | default({}) }}"
 
+- name: Normalize OS platform and alias
+  ansible.builtin.set_fact:
+    software_is_linux: "{{ software_detected.family | default('Windows' if 'windows' in (software_detected.distribution | default('') | lower) else 'Linux') == 'Linux' }}"
+    software_desired_platform_name: >-
+      {{ nautobot_os_platform_names.get(software_detected.distribution | default(''),
+         {'RedHat': 'RHEL', 'Red Hat Enterprise Linux': 'RHEL'}.get(
+           software_detected.distribution | default(''),
+           software_detected.distribution | default('') | regex_replace('^Microsoft ', ''))) }}
+    software_desired_alias: >-
+      {{ software_detected.alias | default('')
+         if 'windows' not in (software_detected.distribution | default('') | lower)
+         else software_detected.distribution }}
+
 - name: Resolve full platform record by ID
   ansible.builtin.set_fact:
     software_platform_matches: >-
@@ -20,11 +33,11 @@
          else 'PLATFORM_UNRESOLVED' if software_platform_matches | length != 1
            or software_platform_matches[0].name | default('') | length == 0
          else 'PLATFORM_OS_MISMATCH' if
-           nautobot_os_platform_names.get(software_detected.distribution, '') != software_platform_matches[0].name
-           and
-           (('windows' if 'windows' in (software_detected.distribution | lower)
-             else software_detected.distribution | lower)
-            not in (software_platform_matches[0].name | lower))
+           (software_is_linux | bool and
+            software_desired_platform_name | lower != software_platform_matches[0].name | lower)
+           or (not software_is_linux | bool and
+               nautobot_os_platform_names.get(software_detected.distribution, '') != software_platform_matches[0].name
+               and 'windows' not in (software_platform_matches[0].name | lower))
          else 'READY' }}
 
 - name: Onboard missing or explicitly approved replacement OS platforms
@@ -40,6 +53,9 @@
       {{ vm_software_report + [{
         'vm': software_host, 'status': software_eligibility,
         'operating_system': software_detected.distribution | default('unknown'),
+        'os_family': software_detected.family | default('unknown'),
+        'proposed_platform': software_desired_platform_name,
+        'alias': software_desired_alias,
         'version': software_detected.version | default('unknown'),
         'platform': software_platform_matches[0].name if software_platform_matches | length == 1 else none,
         'connection': hostvars[software_host].ansible_connection | default('ssh'),
@@ -84,11 +100,54 @@
           {{ vm_software_report + [{
             'vm': software_host,
             'operating_system': software_detected.distribution,
+            'os_family': 'Linux' if software_is_linux | bool else 'Windows',
+            'alias': software_desired_alias,
             'version': software_detected.version,
             'platform': software_platform_matches[0].name,
             'status': 'CURRENT' if software_target_id != '' and software_target_id == software_current_id
                       else 'WOULD_CREATE_AND_ASSIGN' if software_target_id == '' else 'WOULD_ASSIGN'
           }] }}
+
+    - name: Determine whether Linux codename needs updating
+      ansible.builtin.set_fact:
+        software_alias_update_needed: >-
+          {{ software_is_linux | bool and software_target_id != ''
+             and software_desired_alias | length > 0
+             and software_versions.json.results[0].alias | default('') != software_desired_alias }}
+
+    - name: Report proposed Linux alias update
+      ansible.builtin.set_fact:
+        vm_software_report: >-
+          {{ vm_software_report + [{'vm': software_host, 'status': 'WOULD_UPDATE_ALIAS',
+             'platform': software_platform_matches[0].name, 'version': software_detected.version,
+             'old_alias': software_versions.json.results[0].alias | default(''),
+             'alias': software_desired_alias}] }}
+      when: software_alias_update_needed | bool
+
+    - name: Update existing Linux software version codename
+      ansible.builtin.uri:
+        url: "{{ nautobot_url }}/api/dcim/software-versions/{{ software_target_id }}/"
+        method: PATCH
+        headers:
+          Authorization: "Token {{ nautobot_token }}"
+        body_format: json
+        body:
+          alias: "{{ software_desired_alias }}"
+        return_content: true
+      register: software_alias_updated
+      no_log: true
+      changed_when: true
+      when:
+        - software_alias_update_needed | bool
+        - nautobot_software_sync_enabled | bool
+        - not ansible_check_mode
+
+    - name: Verify Linux codename update
+      ansible.builtin.assert:
+        that:
+          - software_alias_updated.json.alias == software_desired_alias
+        success_msg: "Verified software version alias for {{ software_host }}"
+      when: software_alias_updated is not skipped
 
     - name: Apply software version assignment
       when:
@@ -148,7 +207,7 @@
                   platform: "{{ software_matches[0].platform.id }}"
                   version: "{{ software_detected.version }}"
                   status: "{{ software_status.json.results[0].id }}"
-                  alias: "{{ software_detected.distribution }}"
+                  alias: "{{ software_desired_alias }}"
                 status_code: 201
                 return_content: true
               no_log: true

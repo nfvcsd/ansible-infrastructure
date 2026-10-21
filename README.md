@@ -255,16 +255,46 @@ or `psrp`, appropriate credentials, and guest connectivity. Windows over SSH is
 not supported by this workflow. Configure guest credentials through inventory or
 private variables; Hyper-V host credentials do not automatically grant guest access.
 
-Linux records use the distribution version (for example, `24.04`). Windows records
+Linux records follow Nautobot's native platform/software-version model:
+
+| Field | Ubuntu example | Red Hat example |
+|---|---|---|
+| Platform | Ubuntu | RHEL |
+| Version | 24.04 | Detected numbered release |
+| Alias | noble | Detected release codename, if available |
+| OS family in report | Linux | Linux |
+
+The platform is the distribution without a version suffix. `RedHat` and
+`Red Hat Enterprise Linux` normalize to `RHEL`; other distribution names are
+retained. Version comes from `ansible_distribution_version` and alias from
+`ansible_distribution_release` (for example, `jammy` or `noble`). Point-release
+numbers are retained as reported by the guest. Codenames are discovered, not
+inferred from a hardcoded version table. Missing/unknown codenames leave new
+aliases blank and preserve existing aliases.
+
+Apply mode updates an existing Linux Software Version alias if a detected codename
+differs, including when the VM already references that version. This is a shared
+record: its alias changes for all VMs referencing it. Audit reports these changes
+as `WOULD_UPDATE_ALIAS`.
+
+Linux remains an OS family in reports and in the existing platform-based Linux
+inventory selection; this workflow does not create an OS-family custom field or
+tag. Separate distribution platforms prevent equal version numbers from different
+distributions sharing a Software Version record.
+
+Windows records
 use the OS version/build reported by `Win32_OperatingSystem` (for example,
 `10.0.20348`), with its product caption as the software version alias. This does not
 inventory applications, Linux kernel versions, or Windows cumulative-update revisions.
 
 Records are matched by unique, exact Nautobot VM name and inventory hostname.
 Unreachable guests, ambiguous names, and VMs without platforms are reported and
-skipped. The existing platform name must contain the detected Linux distribution
-name (case-insensitive), or `Windows` for Windows guests. Platform naming aliases
-such as `RHEL` for `RedHat` need review before those guests can synchronize.
+skipped. Linux platform names must match the normalized distribution (or its
+explicit `nautobot_os_platform_names` mapping), ignoring case. A legacy platform
+such as `Ubuntu 24.04` or a generic `Linux` platform is reported for migration to
+`Ubuntu`, requiring the platform creation/replacement flags below. Windows retains
+its existing matching behavior: a platform containing `Windows` or an explicit
+mapping is accepted.
 Unclassified or mismatched VMs are reported by default. Optional platform onboarding
 is described below.
 VMs absent from guest inventory are reported separately.
@@ -293,7 +323,7 @@ Existing software versions are reused by platform and exact version. Apply mode
 updates outdated VM assignments and creates missing versions with the `Active`
 status. This status must be enabled for Nautobot Software Versions; override its
 name using `nautobot_software_version_status` if necessary. Existing VM platforms
-and other fields are preserved. The playbook rechecks VM identity, platform, and
+and other fields are preserved unless platform onboarding is explicitly enabled. The playbook rechecks VM identity, platform, and
 current assignment before writing. Run a single sync at a time to avoid competing
 version creation requests. API errors stop reconciliation; already completed
 assignments remain in place and can be audited by rerunning.
@@ -318,7 +348,7 @@ ansible-playbook playbooks/sync-vm-software-versions.yml \
 To apply the reviewed proposals, add `-e nautobot_software_sync_enabled=true`.
 `--check` always prevents writes, even when all flags are enabled.
 
-New platform names default to the Linux distribution name or Windows product
+New platform names default to the normalized Linux distribution name or Windows product
 caption with the leading `Microsoft ` removed. Version numbers are stored in
 Software Version records. To reuse your own platform naming convention, pass a
 private YAML variables file with an explicit mapping, for example:
@@ -330,6 +360,8 @@ nautobot_os_platform_names:
 ```
 
 An explicit mapping also approves that platform name for the detected distribution.
+Use distinct platform names for different distributions; mapping all distributions
+to `Linux` would reintroduce version-number collisions.
 Platforms created earlier in the run are reused. Replacement clears the old software
 version before assigning a version for the new platform; if a later API operation
 fails, rerun after resolving it. API writes are not transactional. Unreachable or

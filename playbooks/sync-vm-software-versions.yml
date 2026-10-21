@@ -32,7 +32,12 @@
     - name: Store Linux release
       ansible.builtin.set_fact:
         vm_software_detected:
+          family: Linux
           distribution: "{{ vm_linux_os.ansible_facts.ansible_distribution }}"
+          alias: >-
+            {{ vm_linux_os.ansible_facts.ansible_distribution_release
+               if vm_linux_os.ansible_facts.ansible_distribution_release | default('') | lower
+                  not in ['', 'na', 'n/a', 'unknown', 'none'] else '' }}
           version: "{{ vm_linux_os.ansible_facts.ansible_distribution_version }}"
       when:
         - vm_linux_os.ansible_facts.ansible_distribution_version is defined
@@ -45,6 +50,7 @@
           $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
           $Ansible.Changed = $false
           $Ansible.Result = @{
+              family = 'Windows'
               distribution = [string]$os.Caption
               version = [string]$os.Version
           }

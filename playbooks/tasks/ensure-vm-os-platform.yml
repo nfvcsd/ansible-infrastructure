@@ -1,11 +1,5 @@
 ---
 # Invoked only for a uniquely identified VM with successfully detected OS facts.
-- name: Select desired OS platform name
-  ansible.builtin.set_fact:
-    software_desired_platform_name: >-
-      {{ nautobot_os_platform_names.get(software_detected.distribution,
-         software_detected.distribution | regex_replace('^Microsoft ', '')) }}
-
 - name: Find existing desired OS platform
   ansible.builtin.set_fact:
     software_desired_platforms: >-
@@ -25,6 +19,8 @@
         'vm': software_host,
         'operating_system': software_detected.distribution,
         'version': software_detected.version,
+        'alias': software_desired_alias,
+        'os_family': 'Linux' if software_is_linux | bool else 'Windows',
         'current_platform': software_platform_matches[0].name if software_platform_matches | length == 1 else none,
         'proposed_platform': software_desired_platform_name,
         'status': 'WOULD_CREATE_AND_ASSIGN_PLATFORM' if software_desired_platforms | length == 0 else 'WOULD_ASSIGN_PLATFORM'
