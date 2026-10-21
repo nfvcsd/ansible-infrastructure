@@ -47,7 +47,10 @@
 
 - name: Configure Hyper-V guest integration utilities
   hosts: hyperv_linux_guests
-  gather_facts: true
+  gather_facts: false
+
+  vars_files:
+    - vars/hyperv-integrations.yml
 
   vars:
 
@@ -99,6 +102,23 @@
 
     hyperv_guest_kvp_systemd_device: >-
       sys-devices-virtual-misc-vmbus\x21hv_kvp.device
+
+  pre_tasks:
+    - name: Validate integration exclusion list
+      ansible.builtin.assert:
+        that:
+          - hyperv_integrations_excluded_devices | type_debug == 'list'
+          - hyperv_integrations_excluded_devices | reject('string') | list | length == 0
+        fail_msg: hyperv_integrations_excluded_devices must be a list of VM names.
+
+    - name: Skip excluded guests before opening an SSH connection
+      ansible.builtin.meta: end_host
+      when: >-
+        inventory_hostname | lower in
+        (hyperv_integrations_excluded_devices | map('lower') | list)
+
+    - name: Gather facts for included guests
+      ansible.builtin.setup:
 
   tasks:
 

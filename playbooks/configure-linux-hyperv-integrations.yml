@@ -20,6 +20,9 @@
   connection: local
   gather_facts: false
 
+  vars_files:
+    - vars/hyperv-integrations.yml
+
   vars:
     nautobot_url: >-
       {{ lookup('env', 'NAUTOBOT_URL') | regex_replace('/+$', '') }}
@@ -30,6 +33,13 @@
       (?i)(linux|ubuntu|debian|rocky|alma|centos|fedora|rhel|red hat|suse|oracle linux)
 
   tasks:
+    - name: Validate integration exclusion list
+      ansible.builtin.assert:
+        that:
+          - hyperv_integrations_excluded_devices | type_debug == 'list'
+          - hyperv_integrations_excluded_devices | reject('string') | list | length == 0
+        fail_msg: hyperv_integrations_excluded_devices must be a list of VM names.
+
     - name: Verify Nautobot connection settings
       ansible.builtin.assert:
         that:
@@ -106,6 +116,7 @@
       loop_control:
         label: "{{ item.name }}"
       when:
+        - item.name | lower not in (hyperv_integrations_excluded_devices | map('lower') | list)
         - item.platform is mapping
         - (item.platform.id | default('')) in linux_platform_ids
         - item.custom_fields.hyper_v_vm_id | default(none) not in [none, '']
@@ -118,6 +129,7 @@
       loop_control:
         label: "{{ item.name }}"
       when:
+        - item.name | lower not in (hyperv_integrations_excluded_devices | map('lower') | list)
         - item.platform is mapping
         - (item.platform.id | default('')) in linux_platform_ids
         - item.custom_fields.hyper_v_vm_id | default(none) in [none, '']
@@ -135,6 +147,7 @@
     - name: Display Nautobot Linux VM summary
       ansible.builtin.debug:
         msg:
+          excluded_devices: "{{ hyperv_integrations_excluded_devices }}"
           linux_vms_with_guid: "{{ linux_vm_guids | length }}"
           linux_vms_without_guid: "{{ linux_vms_without_guid }}"
           action: "Only VMs with matching GUIDs will be targeted"

@@ -405,7 +405,38 @@ ansible-playbook \
 
 If sudo requires an interactive password, append `-K`.
 
-**Important:** The guest stage should use a platform-based Linux inventory group. Verify whether the installed playbook targets `hyperv_linux_guests` or the older `device_roles_linux_server` group.
+The guest stage targets the platform-based `hyperv_linux_guests` inventory group.
+
+#### Excluding devices
+
+Edit `playbooks/vars/hyperv-integrations.yml` to skip selected VMs:
+
+```yaml
+hyperv_integrations_excluded_devices:
+  - example-vm-01
+  - example-vm-02
+```
+
+The list defaults to empty and applies in both audit and apply modes. Excluded
+VMs are removed from host-side integration selection, and excluded guests are
+skipped before SSH connections or fact gathering. The standalone
+`configure-linux-hyperv-integrations.yml` playbook also uses this list.
+
+Names match exactly, ignoring case; wildcards are not supported. Use each
+Nautobot VM name. If its Ansible inventory hostname differs, include that name
+as well so both stages exclude it. All VMs sharing an excluded name are skipped.
+These are guest VM exclusions, not Hyper-V host exclusions.
+
+You can override the list for one run using a YAML variables file:
+
+```bash
+ansible-playbook playbooks/enable-hyperv-integrations-complete.yml \
+  -e @/path/to/private-exclusions.yml
+```
+
+The override file should contain the same `hyperv_integrations_excluded_devices`
+list shown above. An override replaces the saved list. Keep internal device names
+in a private variables file when sharing this repository publicly.
 
 The workflow does not explicitly reboot guest machines.
 

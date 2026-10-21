@@ -1,0 +1,14 @@
+---
+# VM names to skip in both host-side and guest-side integration management.
+# Matching is exact and case-insensitive; wildcards are not supported.
+# Use the Nautobot VM name and, if different, its Ansible inventory hostname.
+# Example:
+# hyperv_integrations_excluded_devices:
+#   - example-vm-01
+hyperv_integrations_excluded_devices:
+  - nfv-protect-observatory
+  - nfv-fortianalyzer-01
+  - VEEAM-REPO-WU
+  - VEEAM-REPO-ELGIN
+  - VEAM-VBR-01
+  - Ruckus
