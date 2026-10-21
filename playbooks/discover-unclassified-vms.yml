@@ -1,0 +1,736 @@
+---
+# ============================================================
+# Discover Unclassified Hyper-V Virtual Machines
+#
+# Requirements:
+#   - Working discover-hyperv-all.yml
+#   - NAUTOBOT_URL environment variable
+#   - NAUTOBOT_TOKEN environment variable
+#   - SSH access to approved Linux VMs
+#
+# Safety:
+#   - Does not change guest operating systems
+#   - Does not change Hyper-V configuration
+#   - Does not probe unapproved VMs
+#   - Does not scan subnets
+#   - Does not disable SSH host key verification
+#   - Does not overwrite existing Nautobot platforms
+#   - Nautobot updates disabled by default
+#
+# Modes:
+#   1. Inventory audit
+#   2. Approved SSH discovery
+#   3. Explicitly enabled Nautobot synchronization
+# ============================================================
+
+
+# ============================================================
+# Stage 1: Discover Hyper-V inventory
+# ============================================================
+
+- import_playbook: discover-hyperv-all.yml
+
+
+# ============================================================
+# Stage 2: Identify unclassified Nautobot VMs
+# ============================================================
+
+- name: Identify unclassified virtual machines
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+
+    nautobot_url: >-
+      {{ lookup('env', 'NAUTOBOT_URL') | regex_replace('/+$', '') }}
+
+    nautobot_token: "{{ lookup('env', 'NAUTOBOT_TOKEN') }}"
+
+    # --------------------------------------------------------
+    # SSH discovery settings
+    # --------------------------------------------------------
+
+    vm_discovery_probe_enabled: false
+
+    vm_discovery_ssh_user: asnyder
+
+    # Optional. Leave empty to use normal SSH configuration.
+    vm_discovery_ssh_private_key_file: ""
+
+    # --------------------------------------------------------
+    # Approved VM names for Linux SSH probing
+    #
+    # These names are candidates, not OS classifications.
+    # Only listed VMs may be contacted.
+    #
+    # Add or remove VMs after reviewing your environment.
+    # --------------------------------------------------------
+
+    vm_discovery_approved_names:
+      - nfv-ansible-01
+      - nfv-nginx-01
+      - nfv-snipeit-01
+      - nfv-uptime-01
+      - nfv-vaultwarden-01
+
+      - k8s-a-cp1
+      - k8s-a-cp2
+      - k8s-a-cp3
+      - k8s-a-w1
+
+      - k8s-b-cp1
+      - k8s-b-cp2
+      - k8s-b-cp3
+      - k8s-b-w1
+
+      - VEEAM-REPO-WU
+      - VEEAM-REPO-ELGIN
+
+    # --------------------------------------------------------
+    # Approved OS-to-platform mappings
+    #
+    # The right-hand value must match an existing
+    # Nautobot platform name exactly.
+    # --------------------------------------------------------
+
+    vm_discovery_platform_mappings:
+      "ubuntu:20.04": "Ubuntu 20.04"
+      "ubuntu:22.04": "Ubuntu 22.04"
+      "ubuntu:24.04": "Ubuntu 24.04"
+
+  tasks:
+
+    # --------------------------------------------------------
+    # Validate configuration
+    # --------------------------------------------------------
+
+    - name: Verify Nautobot credentials
+      ansible.builtin.assert:
+        that:
+          - nautobot_url | length > 0
+          - nautobot_token | length > 0
+        fail_msg: >-
+          NAUTOBOT_URL and NAUTOBOT_TOKEN must be configured.
+      no_log: true
+
+    - name: Verify complete Hyper-V discovery
+      ansible.builtin.assert:
+        that:
+          - all_discovered_vms is defined
+          - all_discovered_vms | length > 0
+          - duplicate_vm_guids is defined
+          - duplicate_vm_guids | length == 0
+          - >-
+            (
+              groups.get('hyperv_discovery_complete', []) | sort
+            )
+            ==
+            (
+              groups.get('hyperv_hosts', []) | sort
+            )
+        fail_msg: >-
+          Hyper-V discovery is incomplete or contains duplicate GUIDs.
+
+    # --------------------------------------------------------
+    # Retrieve Nautobot records
+    # --------------------------------------------------------
+
+    - name: Retrieve Nautobot virtual machines
+      ansible.builtin.uri:
+        url: "{{ nautobot_url }}/api/virtualization/virtual-machines/?limit=1000"
+        method: GET
+        headers:
+          Authorization: "Token {{ nautobot_token }}"
+          Accept: application/json
+        return_content: true
+        status_code: 200
+        validate_certs: true
+      register: nautobot_vms
+      changed_when: false
+      no_log: true
+
+    - name: Retrieve Nautobot platforms
+      ansible.builtin.uri:
+        url: "{{ nautobot_url }}/api/dcim/platforms/?limit=1000"
+        method: GET
+        headers:
+          Authorization: "Token {{ nautobot_token }}"
+          Accept: application/json
+        return_content: true
+        status_code: 200
+        validate_certs: true
+      register: nautobot_platforms
+      changed_when: false
+      no_log: true
+
+    - name: Verify complete Nautobot results
+      ansible.builtin.assert:
+        that:
+          - nautobot_vms.json.next is none
+          - nautobot_platforms.json.next is none
+        fail_msg: "Nautobot API pagination detected. Aborting."
+
+    # --------------------------------------------------------
+    # Identify VMs with missing platforms
+    # --------------------------------------------------------
+
+    - name: Identify unclassified VM records
+      ansible.builtin.set_fact:
+        unclassified_vms: >-
+          {{
+            nautobot_vms.json.results
+            | rejectattr('platform')
+            | list
+          }}
+
+    # The Nautobot API may represent an empty relationship
+    # as null, so use an explicit loop as well.
+
+    - name: Initialize unclassified VM list
+      ansible.builtin.set_fact:
+        unclassified_vms: []
+        approved_vm_candidates: []
+        matched_vm_candidates: []
+
+    - name: Collect VMs without platform assignments
+      ansible.builtin.set_fact:
+        unclassified_vms: "{{ unclassified_vms + [item] }}"
+      loop: "{{ nautobot_vms.json.results }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when:
+        - item.platform is not mapping
+
+    # --------------------------------------------------------
+    # Match approved VMs to Hyper-V
+    # --------------------------------------------------------
+
+    - name: Match approved VMs using Hyper-V GUIDs
+      ansible.builtin.set_fact:
+        matched_vm_candidates: >-
+          {{
+            matched_vm_candidates + [{
+              'name': item.name,
+              'nautobot_id': item.id,
+              'guid': stored_guid,
+              'hypervisor': hyperv_matches[0].Hypervisor,
+              'primary_ip_id': primary_ip_id
+            }]
+          }}
+      vars:
+
+        stored_guid: >-
+          {{
+            item.custom_fields.hyper_v_vm_id
+            | default('', true)
+            | string
+            | lower
+          }}
+
+        hyperv_matches: >-
+          {{
+            all_discovered_vms
+            | selectattr('VMId', 'equalto', stored_guid)
+            | list
+          }}
+
+        primary_ip_id: >-
+          {{
+            item.primary_ip4.id
+            if item.primary_ip4 is mapping
+            else ''
+          }}
+
+      loop: "{{ unclassified_vms }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when:
+        - item.name | lower in
+          (vm_discovery_approved_names | map('lower') | list)
+        - stored_guid | length > 0
+        - hyperv_matches | length == 1
+        - hyperv_matches[0].Name | lower == item.name | lower
+        - hyperv_matches[0].State == 'Running'
+        - primary_ip_id | length > 0
+
+    # --------------------------------------------------------
+    # Verify unique candidates
+    # --------------------------------------------------------
+
+    - name: Verify unique Nautobot targets
+      ansible.builtin.assert:
+        that:
+          - >-
+            (
+              matched_vm_candidates
+              | map(attribute='nautobot_id')
+              | unique
+              | list
+              | length
+            ) == (matched_vm_candidates | length)
+          - >-
+            (
+              matched_vm_candidates
+              | map(attribute='guid')
+              | unique
+              | list
+              | length
+            ) == (matched_vm_candidates | length)
+        fail_msg: "Duplicate VM identity detected. Aborting."
+
+    # --------------------------------------------------------
+    # Retrieve management IP addresses
+    # --------------------------------------------------------
+
+    - name: Retrieve approved VM management IPs
+      ansible.builtin.uri:
+        url: >-
+          {{ nautobot_url }}/api/ipam/ip-addresses/{{ item.primary_ip_id }}/
+        method: GET
+        headers:
+          Authorization: "Token {{ nautobot_token }}"
+          Accept: application/json
+        return_content: true
+        status_code: 200
+        validate_certs: true
+      loop: "{{ matched_vm_candidates }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: vm_ip_lookup
+      changed_when: false
+      no_log: true
+      when:
+        - vm_discovery_probe_enabled | bool
+
+    # --------------------------------------------------------
+    # Build temporary SSH inventory
+    # --------------------------------------------------------
+
+    - name: Add approved VM to temporary SSH inventory
+      ansible.builtin.add_host:
+        name: "vmprobe_{{ item.item.nautobot_id | replace('-', '_') }}"
+        groups: unclassified_vm_ssh_probe
+        ansible_connection: ssh
+        ansible_host: "{{ item.json.address.split('/')[0] }}"
+        ansible_user: "{{ vm_discovery_ssh_user }}"
+        ansible_ssh_private_key_file: >-
+          {{
+            vm_discovery_ssh_private_key_file
+            if vm_discovery_ssh_private_key_file | length > 0
+            else omit
+          }}
+        ansible_ssh_common_args: >-
+          -o StrictHostKeyChecking=yes
+          -o ConnectTimeout=5
+          -o ConnectionAttempts=1
+        target_vm_name: "{{ item.item.name }}"
+        target_nautobot_id: "{{ item.item.nautobot_id }}"
+        target_guid: "{{ item.item.guid }}"
+        target_hypervisor: "{{ item.item.hypervisor }}"
+      loop: "{{ vm_ip_lookup.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+      when:
+        - not item.skipped | default(false)
+        - item.json is defined
+        - item.json.address is defined
+        - item.json.address is match('^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+/')
+        - not ansible_check_mode
+
+    # --------------------------------------------------------
+    # Inventory audit
+    # --------------------------------------------------------
+
+    - name: Display approved VM candidates
+      ansible.builtin.debug:
+        msg:
+          vm: "{{ item.name }}"
+          hypervisor: "{{ item.hypervisor }}"
+          guid: "{{ item.guid }}"
+          primary_ip_id: "{{ item.primary_ip_id }}"
+          ssh_probe_enabled: "{{ vm_discovery_probe_enabled | bool }}"
+      loop: "{{ matched_vm_candidates }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Display candidate summary
+      ansible.builtin.debug:
+        msg:
+          hyperv_vms: "{{ all_discovered_vms | length }}"
+          nautobot_vms: "{{ nautobot_vms.json.results | length }}"
+          unclassified_vms: "{{ unclassified_vms | length }}"
+          approved_candidates: "{{ matched_vm_candidates | length }}"
+          ssh_probing_enabled: "{{ vm_discovery_probe_enabled | bool }}"
+
+
+# ============================================================
+# Stage 3: Discover guest operating systems
+# ============================================================
+
+- name: Probe approved unclassified Linux candidates
+  hosts: unclassified_vm_ssh_probe
+  gather_facts: false
+
+  tasks:
+
+    # --------------------------------------------------------
+    # Use raw SSH to avoid requiring remote Python
+    #
+    # The command is read-only and prints normalized
+    # values from /etc/os-release.
+    # --------------------------------------------------------
+
+    - name: Read guest operating-system identification
+      ansible.builtin.raw: >-
+        sh -c '. /etc/os-release;
+        printf "ID=%s\nVERSION_ID=%s\n" "$ID" "$VERSION_ID"'
+      register: guest_os_probe
+      changed_when: false
+      failed_when: false
+      ignore_unreachable: true
+
+    - name: Display guest OS discovery
+      ansible.builtin.debug:
+        msg:
+          vm: "{{ target_vm_name }}"
+          ip: "{{ ansible_host }}"
+          output: "{{ guest_os_probe.stdout | default('') }}"
+          error: "{{ guest_os_probe.stderr | default('') }}"
+          reachable: >-
+            {{
+              not (guest_os_probe.unreachable | default(false))
+              and (guest_os_probe.rc | default(1) == 0)
+            }}
+
+
+# ============================================================
+# Stage 4: Reconcile results with Nautobot
+# ============================================================
+
+- name: Reconcile newly discovered guest operating systems
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+
+    nautobot_url: >-
+      {{ lookup('env', 'NAUTOBOT_URL') | regex_replace('/+$', '') }}
+
+    nautobot_token: "{{ lookup('env', 'NAUTOBOT_TOKEN') }}"
+
+    nautobot_platform_sync_enabled: false
+
+    vm_discovery_platform_mappings:
+      "ubuntu:20.04": "Ubuntu 20.04"
+      "ubuntu:22.04": "Ubuntu 22.04"
+      "ubuntu:24.04": "Ubuntu 24.04"
+
+  tasks:
+
+    # --------------------------------------------------------
+    # Normalize discovery results
+    # --------------------------------------------------------
+
+    - name: Initialize guest OS report
+      ansible.builtin.set_fact:
+        guest_os_report: []
+
+    - name: Build discovered guest OS report
+      ansible.builtin.set_fact:
+        guest_os_report: >-
+          {{
+            guest_os_report + [{
+              'vm_name': hostvars[item].target_vm_name,
+              'nautobot_id': hostvars[item].target_nautobot_id,
+              'guid': hostvars[item].target_guid,
+              'ip': hostvars[item].ansible_host,
+              'os_id': os_id,
+              'os_version': os_version,
+              'os_key': os_key,
+              'platform_name': desired_platform,
+              'platform_id': (
+                platform_matches[0].id
+                if platform_matches | length == 1
+                else ''
+              ),
+              'status': status
+            }]
+          }}
+
+      vars:
+
+        probe: "{{ hostvars[item].guest_os_probe | default({}) }}"
+
+        probe_success: >-
+          {{
+            not (probe.unreachable | default(false))
+            and (probe.rc | default(1) == 0)
+          }}
+
+        os_id_matches: >-
+          {{
+            probe.stdout | default('')
+            | regex_findall('(?m)^ID=([^\\r\\n]+)')
+          }}
+
+        os_version_matches: >-
+          {{
+            probe.stdout | default('')
+            | regex_findall('(?m)^VERSION_ID=([^\\r\\n]+)')
+          }}
+
+        os_id: >-
+          {{
+            os_id_matches[0] | lower
+            if os_id_matches | length == 1
+            else ''
+          }}
+
+        os_version: >-
+          {{
+            os_version_matches[0]
+            if os_version_matches | length == 1
+            else ''
+          }}
+
+        os_key: "{{ os_id ~ ':' ~ os_version }}"
+
+        desired_platform: >-
+          {{
+            vm_discovery_platform_mappings.get(os_key, '')
+          }}
+
+        platform_matches: >-
+          {{
+            nautobot_platforms.json.results
+            | selectattr('name', 'equalto', desired_platform)
+            | list
+            if desired_platform | length > 0
+            else []
+          }}
+
+        status: >-
+          {{
+            'SSH_FAILED'
+            if not probe_success
+            else 'UNKNOWN_OS'
+            if os_id == '' or os_version == ''
+            else 'NO_PLATFORM_MAPPING'
+            if desired_platform == ''
+            else 'PLATFORM_NOT_FOUND'
+            if platform_matches | length != 1
+            else 'READY'
+          }}
+
+      loop: "{{ groups.get('unclassified_vm_ssh_probe', []) }}"
+      loop_control:
+        label: "{{ hostvars[item].target_vm_name }}"
+
+    # --------------------------------------------------------
+    # Separate approved changes from skipped systems
+    # --------------------------------------------------------
+
+    - name: Categorize discovered VMs
+      ansible.builtin.set_fact:
+
+        guest_platform_updates: >-
+          {{
+            guest_os_report
+            | selectattr('status', 'equalto', 'READY')
+            | list
+          }}
+
+        guest_platform_skipped: >-
+          {{
+            guest_os_report
+            | rejectattr('status', 'equalto', 'READY')
+            | list
+          }}
+
+    # --------------------------------------------------------
+    # Verify unique update targets
+    # --------------------------------------------------------
+
+    - name: Verify unique platform update targets
+      ansible.builtin.assert:
+        that:
+          - >-
+            (
+              guest_platform_updates
+              | map(attribute='nautobot_id')
+              | unique
+              | list
+              | length
+            ) == (guest_platform_updates | length)
+        fail_msg: >-
+          Duplicate platform update targets detected.
+          Synchronization aborted.
+
+    # --------------------------------------------------------
+    # Display proposed changes
+    # --------------------------------------------------------
+
+    - name: Display proposed platform assignments
+      ansible.builtin.debug:
+        msg:
+          vm: "{{ item.vm_name }}"
+          ip: "{{ item.ip }}"
+          detected_os: "{{ item.os_key }}"
+          proposed_platform: "{{ item.platform_name }}"
+          hyperv_guid: "{{ item.guid }}"
+          action: WOULD_UPDATE
+      loop: "{{ guest_platform_updates }}"
+      loop_control:
+        label: "{{ item.vm_name }}"
+
+    # --------------------------------------------------------
+    # Display systems requiring manual review
+    # --------------------------------------------------------
+
+    - name: Display unclassified guest discovery failures
+      ansible.builtin.debug:
+        msg:
+          vm: "{{ item.vm_name }}"
+          ip: "{{ item.ip }}"
+          detected_os: "{{ item.os_key }}"
+          status: "{{ item.status }}"
+      loop: "{{ guest_platform_skipped }}"
+      loop_control:
+        label: "{{ item.vm_name }}"
+
+    # --------------------------------------------------------
+    # Recheck current VM records before any update
+    # --------------------------------------------------------
+
+    - name: Retrieve current Nautobot VM records before updating
+      ansible.builtin.uri:
+        url: >-
+          {{ nautobot_url }}/api/virtualization/virtual-machines/{{ item.nautobot_id }}/
+        method: GET
+        headers:
+          Authorization: "Token {{ nautobot_token }}"
+          Accept: application/json
+        return_content: true
+        status_code: 200
+        validate_certs: true
+      loop: "{{ guest_platform_updates }}"
+      loop_control:
+        label: "{{ item.vm_name }}"
+      register: current_vm_records
+      changed_when: false
+      no_log: true
+      when:
+        - nautobot_platform_sync_enabled | bool
+        - not ansible_check_mode
+
+    - name: Verify VMs are still eligible for updates
+      ansible.builtin.assert:
+        that:
+          - item.json.platform is not mapping
+          - >-
+            (
+              item.json.custom_fields.hyper_v_vm_id
+              | default('', true)
+              | string
+              | lower
+            ) == item.item.guid
+          - item.json.name | lower == item.item.vm_name | lower
+        fail_msg: >-
+          Nautobot VM changed after discovery.
+          Synchronization aborted.
+      loop: "{{ current_vm_records.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.vm_name }}"
+      when:
+        - not item.skipped | default(false)
+
+    # --------------------------------------------------------
+    # Apply explicitly enabled updates
+    # --------------------------------------------------------
+
+    - name: Update Nautobot VM platforms
+      ansible.builtin.uri:
+        url: >-
+          {{ nautobot_url }}/api/virtualization/virtual-machines/{{ item.nautobot_id }}/
+        method: PATCH
+        headers:
+          Authorization: "Token {{ nautobot_token }}"
+          Accept: application/json
+        body_format: json
+        body:
+          platform: "{{ item.platform_id }}"
+        status_code: 200
+        return_content: true
+        validate_certs: true
+      loop: "{{ guest_platform_updates }}"
+      loop_control:
+        label: "{{ item.vm_name }}"
+      register: platform_sync_results
+      no_log: true
+      when:
+        - nautobot_platform_sync_enabled | bool
+        - not ansible_check_mode
+
+    # --------------------------------------------------------
+    # Verify successful synchronization
+    # --------------------------------------------------------
+
+    - name: Verify platform synchronization
+      ansible.builtin.assert:
+        that:
+          - item.json.platform.id == item.item.platform_id
+        success_msg: >-
+          Verified platform assignment for
+          {{ item.item.vm_name }}
+        fail_msg: >-
+          Platform verification failed for
+          {{ item.item.vm_name }}
+      loop: "{{ platform_sync_results.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.vm_name }}"
+      when:
+        - not item.skipped | default(false)
+
+    # --------------------------------------------------------
+    # Final summary
+    # --------------------------------------------------------
+
+    - name: Display discovery summary
+      ansible.builtin.debug:
+        msg:
+          hyperv_vms_discovered: "{{ all_discovered_vms | length }}"
+
+          nautobot_vm_records: >-
+            {{ nautobot_vms.json.results | length }}
+
+          unclassified_vm_records: "{{ unclassified_vms | length }}"
+
+          approved_candidates_with_ips: >-
+            {{ matched_vm_candidates | length }}
+
+          ssh_hosts_probed: >-
+            {{
+              groups.get('unclassified_vm_ssh_probe', [])
+              | length
+            }}
+
+          successful_os_discoveries: >-
+            {{
+              guest_os_report
+              | rejectattr('status', 'equalto', 'SSH_FAILED')
+              | rejectattr('status', 'equalto', 'UNKNOWN_OS')
+              | length
+            }}
+
+          proposed_platform_updates: >-
+            {{ guest_platform_updates | length }}
+
+          requiring_manual_review: >-
+            {{ guest_platform_skipped | length }}
+
+          platform_sync_enabled: >-
+            {{ nautobot_platform_sync_enabled | bool }}
+
+          hyperv_modified: false

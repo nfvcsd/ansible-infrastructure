@@ -13,3 +13,11 @@ group_by:
 rename_variables:
   - pattern: "^tags$"
     repl: "nautobot_tags"
+groups:
+  hyperv_linux_guests: >-
+    is_virtual | default(false) | bool
+    and
+    (
+      platform | default('') | string | lower
+      | regex_search('ubuntu|debian|rocky|almalinux|centos|fedora|rhel|red.hat|suse|linux')
+    ) is not none
